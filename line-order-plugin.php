@@ -62,8 +62,60 @@ function lo_register_taxonomy() {
 register_activation_hook( __FILE__, function() {
     lo_register_post_type();
     lo_register_taxonomy();
+    lo_create_orders_table();
     flush_rewrite_rules();
 } );
+
+/* =========================================================
+   DB TABLE
+========================================================= */
+function lo_create_orders_table() {
+    global $wpdb;
+    $table   = $wpdb->prefix . 'lo_orders';
+    $charset = $wpdb->get_charset_collate();
+    $sql = "CREATE TABLE IF NOT EXISTS {$table} (
+        id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        post_id      BIGINT UNSIGNED NOT NULL,
+        product_name VARCHAR(255)   NOT NULL DEFAULT '',
+        group_label  VARCHAR(255)   NOT NULL DEFAULT '',
+        model_label  VARCHAR(255)   NOT NULL DEFAULT '',
+        model_number VARCHAR(255)   NOT NULL DEFAULT '',
+        img_id       BIGINT UNSIGNED NOT NULL DEFAULT 0,
+        img_url      TEXT           NOT NULL DEFAULT '',
+        line_status  VARCHAR(20)    NOT NULL DEFAULT 'pending',
+        order_status VARCHAR(20)    NOT NULL DEFAULT 'new',
+        line_message LONGTEXT       NOT NULL DEFAULT '',
+        created_at   DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at   DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_post_id (post_id),
+        KEY idx_order_status (order_status),
+        KEY idx_created_at (created_at)
+    ) {$charset};";
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    dbDelta( $sql );
+    update_option( 'lo_db_version', '1.1' );
+}
+add_action( 'plugins_loaded', function() {
+    global $wpdb;
+    if ( get_option('lo_db_version') !== '1.1' ) {
+        lo_create_orders_table();
+        /* 既存テーブルへのカラム追加（アップグレード用） */
+        $table = $wpdb->prefix . 'lo_orders';
+        $cols  = $wpdb->get_col("DESC {$table}", 0);
+        if ( !in_array('img_id',  $cols) ) $wpdb->query("ALTER TABLE {$table} ADD img_id  BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER model_number");
+        if ( !in_array('img_url', $cols) ) $wpdb->query("ALTER TABLE {$table} ADD img_url TEXT           NOT NULL DEFAULT '' AFTER img_id");
+    }
+} );
+
+add_action( 'admin_menu', 'lo_add_orders_page' );
+function lo_add_orders_page() {
+    add_submenu_page(
+        'edit.php?post_type=lo_product',
+        '発注履歴', '発注履歴', 'edit_posts',
+        'lo-orders', 'lo_orders_page_html'
+    );
+}
 
 add_action( 'admin_menu', 'lo_add_settings_page' );
 function lo_add_settings_page() {
@@ -127,35 +179,114 @@ add_action('wp_ajax_lo_submit',        'lo_ajax_submit');
 add_action('wp_ajax_nopriv_lo_submit', 'lo_ajax_submit');
 function lo_ajax_submit() {
     check_ajax_referer('lo_front','nonce');
+    global $wpdb;
+
     $pid = absint( $_POST['post_id'] ?? 0 );
     if ( !$pid || get_post_type($pid) !== 'lo_product' ) wp_send_json_error('無効なリクエストです。');
-    /* 選択された型番を1件受け取る */
+
     $selected_model = isset($_POST['lo_selected_model']) ? sanitize_text_field($_POST['lo_selected_model']) : '';
     if ( empty($selected_model) ) wp_send_json_error('型番を選択してください。');
 
-    $lines  = array('【LINE発注】', '商品名：'.get_the_title($pid), '選択型番：');
+    $product_name = get_the_title($pid);
+    $group_label  = '';
+    $model_label  = '';
     $groups = get_post_meta($pid,'_lo_groups',true);
-    /* グループを検索して一致するラベルを見つける */
     if ( is_array($groups) ) {
-        $found = false;
         foreach ( $groups as $gi => $g ) {
             foreach ( ($g['options']??array()) as $o ) {
                 if ( ($o['model']??'') === $selected_model ) {
-                    $lbl     = !empty($g['label']) ? $g['label'] : 'グループ'.($gi+1);
-                    $ol      = !empty($o['label'])  ? '（'.$o['label'].'）' : '';
-                    $lines[] = '  ・'.$lbl.'：'.$selected_model.$ol;
-                    $found   = true;
+                    $group_label = !empty($g['label']) ? $g['label'] : 'グループ'.($gi+1);
+                    $model_label = $o['label'] ?? '';
                     break 2;
                 }
             }
         }
-        if (!$found) $lines[] = '  ・'.$selected_model;
     }
-    $lines[] = '';
-    $lines[] = '送信日時：'.wp_date('Y/m/d H:i',null,new DateTimeZone('Asia/Tokyo'));
-    $r = lo_send_line( implode("\n",$lines) );
-    if ($r['success']) wp_send_json_success('ご注文を受け付けました。LINEへ送信しました。');
-    else               wp_send_json_error('送信失敗: '.$r['message']);
+
+    /* 画像情報を取得 */
+    $img_id  = (int) get_post_meta($pid,'_lo_img_id',true);
+    $img_url = $img_id ? (string) wp_get_attachment_url($img_id) : '';
+
+    $now     = wp_date('Y/m/d H:i', null, new DateTimeZone('Asia/Tokyo'));
+    $detail  = ( $group_label ? $group_label . '：' : '' ) . $selected_model . ( $model_label ? '（'.$model_label.'）' : '' );
+    $message = implode("\n", array(
+        '【LINE発注】',
+        '商品名：'   . $product_name,
+        '選択型番：  ' . $detail,
+        '',
+        '送信日時：' . $now,
+    ));
+
+    /* LINE送信 */
+    $r_line      = lo_send_line( $message );
+    $line_status = $r_line['success'] ? 'sent' : 'failed';
+
+    /* DB保存 */
+    $table = $wpdb->prefix . 'lo_orders';
+    $wpdb->insert( $table, array(
+        'post_id'      => $pid,
+        'product_name' => $product_name,
+        'group_label'  => $group_label,
+        'model_label'  => $model_label,
+        'model_number' => $selected_model,
+        'img_id'       => $img_id,
+        'img_url'      => $img_url,
+        'line_status'  => $line_status,
+        'order_status' => 'new',
+        'line_message' => $message,
+    ), array('%d','%s','%s','%s','%s','%d','%s','%s','%s','%s') );
+
+    if ( $r_line['success'] ) {
+        wp_send_json_success('ご注文を受け付けました。LINEへ送信しました。');
+    } else {
+        wp_send_json_error('発注を保存しましたが、LINE送信に失敗しました: ' . $r_line['message']);
+    }
+}
+
+/* =========================================================
+   ORDER STATUS UPDATE AJAX (管理画面用)
+========================================================= */
+add_action('wp_ajax_lo_update_order_status', 'lo_ajax_update_order_status');
+function lo_ajax_update_order_status() {
+    check_ajax_referer('lo_admin','nonce');
+    if ( !current_user_can('edit_posts') ) wp_send_json_error('権限がありません。');
+    global $wpdb;
+    $oid    = absint( $_POST['order_id'] ?? 0 );
+    $status = sanitize_text_field( $_POST['status'] ?? '' );
+    $allowed = array('new','processing','done','cancelled');
+    if ( !$oid || !in_array($status, $allowed) ) wp_send_json_error('不正なリクエストです。');
+    $table = $wpdb->prefix . 'lo_orders';
+    $wpdb->update( $table, array('order_status'=>$status), array('id'=>$oid), array('%s'), array('%d') );
+    wp_send_json_success('ステータスを更新しました。');
+}
+
+/* LINE再送信 AJAX */
+add_action('wp_ajax_lo_resend_line', 'lo_ajax_resend_line');
+function lo_ajax_resend_line() {
+    check_ajax_referer('lo_admin','nonce');
+    if ( !current_user_can('edit_posts') ) wp_send_json_error('権限がありません。');
+    global $wpdb;
+    $oid   = absint( $_POST['order_id'] ?? 0 );
+    $table = $wpdb->prefix . 'lo_orders';
+    $order = $wpdb->get_row( $wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $oid) );
+    if ( !$order ) wp_send_json_error('発注が見つかりません。');
+    $r = lo_send_line( $order->line_message );
+    $status = $r['success'] ? 'sent' : 'failed';
+    $wpdb->update( $table, array('line_status'=>$status), array('id'=>$oid), array('%s'), array('%d') );
+    if ($r['success']) wp_send_json_success('LINE再送信しました。');
+    else               wp_send_json_error('再送信失敗: '.$r['message']);
+}
+
+/* 削除 AJAX */
+add_action('wp_ajax_lo_delete_order', 'lo_ajax_delete_order');
+function lo_ajax_delete_order() {
+    check_ajax_referer('lo_admin','nonce');
+    if ( !current_user_can('edit_posts') ) wp_send_json_error('権限がありません。');
+    global $wpdb;
+    $oid   = absint( $_POST['order_id'] ?? 0 );
+    $table = $wpdb->prefix . 'lo_orders';
+    $wpdb->delete( $table, array('id'=>$oid), array('%d') );
+    wp_send_json_success('削除しました。');
 }
 
 add_action('admin_enqueue_scripts','lo_admin_scripts');
@@ -483,6 +614,288 @@ function lo_sc_page_html() {
     .lo-sc-copy-btn:hover{background:#135e96;border-color:#135e96;}
     .lo-sc-notice{text-align:center;padding:10px 0;}
     </style>
+    <?php
+}
+
+/* =========================================================
+   ORDERS PAGE HTML
+========================================================= */
+function lo_orders_page_html() {
+    global $wpdb;
+    $table = $wpdb->prefix . 'lo_orders';
+
+    /* ステータスラベル定義 */
+    $order_statuses = array(
+        'new'        => array('label'=>'新規',      'color'=>'#2271b1'),
+        'processing' => array('label'=>'処理中',    'color'=>'#f0b429'),
+        'done'       => array('label'=>'完了',      'color'=>'#00B900'),
+        'cancelled'  => array('label'=>'キャンセル','color'=>'#dc3545'),
+    );
+    $line_statuses = array(
+        'sent'   => array('label'=>'送信済', 'color'=>'#00B900'),
+        'failed' => array('label'=>'失敗',   'color'=>'#dc3545'),
+        'pending'=> array('label'=>'未送信', 'color'=>'#999'),
+    );
+
+    /* フィルター */
+    $filter_status = isset($_GET['lo_status']) ? sanitize_text_field($_GET['lo_status']) : '';
+    $filter_pid    = absint($_GET['lo_pid'] ?? 0);
+    $page          = max(1, absint($_GET['paged'] ?? 1));
+    $per_page      = 20;
+    $offset        = ($page - 1) * $per_page;
+
+    $where = 'WHERE 1=1';
+    $params = array();
+    if ($filter_status) { $where .= ' AND order_status=%s'; $params[] = $filter_status; }
+    if ($filter_pid)    { $where .= ' AND post_id=%d';      $params[] = $filter_pid; }
+
+    $count_sql = "SELECT COUNT(*) FROM {$table} {$where}";
+    $data_sql  = "SELECT * FROM {$table} {$where} ORDER BY created_at DESC LIMIT %d OFFSET %d";
+
+    if ($params) {
+        $count = (int) $wpdb->get_var( $wpdb->prepare($count_sql, ...$params) );
+        $orders = $wpdb->get_results( $wpdb->prepare($data_sql, ...array_merge($params, array($per_page, $offset))) );
+    } else {
+        $count  = (int) $wpdb->get_var($count_sql);
+        $orders = $wpdb->get_results( $wpdb->prepare("SELECT * FROM {$table} ORDER BY created_at DESC LIMIT %d OFFSET %d", $per_page, $offset) );
+    }
+    $total_pages = max(1, ceil($count / $per_page));
+
+    /* 商品リスト (フィルター用) */
+    $products = get_posts(array('post_type'=>'lo_product','post_status'=>array('publish','draft'),'posts_per_page'=>-1,'orderby'=>'title','order'=>'ASC'));
+
+    $admin_nonce = wp_create_nonce('lo_admin');
+    $base_url    = admin_url('edit.php?post_type=lo_product&page=lo-orders');
+    ?>
+    <div class="wrap">
+        <h1 style="display:flex;align-items:center;gap:10px;">
+            <span class="dashicons dashicons-list-view" style="font-size:28px;width:28px;height:28px;color:#2271b1;"></span>
+            発注履歴
+            <span style="font-size:14px;font-weight:400;color:#666;margin-left:8px;">全 <?php echo $count; ?> 件</span>
+        </h1>
+
+        <!-- フィルターバー -->
+        <div style="display:flex;gap:10px;align-items:center;margin:16px 0;flex-wrap:wrap;background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 16px;">
+            <form method="get" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;width:100%;">
+                <input type="hidden" name="post_type" value="lo_product"/>
+                <input type="hidden" name="page" value="lo-orders"/>
+                <label style="font-size:13px;font-weight:600;">ステータス：</label>
+                <select name="lo_status" style="font-size:13px;padding:4px 8px;border-radius:4px;border:1px solid #ccc;">
+                    <option value="">すべて</option>
+                    <?php foreach ($order_statuses as $k=>$v): ?>
+                    <option value="<?php echo $k; ?>" <?php selected($filter_status,$k); ?>><?php echo $v['label']; ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <label style="font-size:13px;font-weight:600;margin-left:8px;">商品：</label>
+                <select name="lo_pid" style="font-size:13px;padding:4px 8px;border-radius:4px;border:1px solid #ccc;">
+                    <option value="">すべて</option>
+                    <?php foreach ($products as $p): ?>
+                    <option value="<?php echo $p->ID; ?>" <?php selected($filter_pid,$p->ID); ?>><?php echo esc_html($p->post_title); ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <button type="submit" class="button" style="font-size:13px;">絞り込み</button>
+                <a href="<?php echo $base_url; ?>" class="button" style="font-size:13px;">リセット</a>
+            </form>
+        </div>
+
+        <?php if (empty($orders)): ?>
+        <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:40px;text-align:center;color:#888;">
+            <span class="dashicons dashicons-cart" style="font-size:48px;width:48px;height:48px;display:block;margin:0 auto 12px;color:#ccc;"></span>
+            <p>発注データがありません。</p>
+        </div>
+        <?php else: ?>
+
+        <!-- 件数・ページネーション上部 -->
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <span style="font-size:13px;color:#666;"><?php echo (($page-1)*$per_page+1); ?>〜<?php echo min($page*$per_page,$count); ?> 件 / 全 <?php echo $count; ?> 件</span>
+            <?php if ($total_pages > 1): ?>
+            <div style="display:flex;gap:4px;">
+                <?php for($p_=1;$p_<=$total_pages;$p_++): ?>
+                <a href="<?php echo $base_url.'&paged='.$p_.($filter_status?'&lo_status='.$filter_status:'').($filter_pid?'&lo_pid='.$filter_pid:''); ?>"
+                   style="padding:4px 10px;border:1px solid <?php echo $p_==$page?'#2271b1':'#ccc'; ?>;border-radius:4px;font-size:13px;color:<?php echo $p_==$page?'#fff':'#333'; ?>;background:<?php echo $p_==$page?'#2271b1':'#fff'; ?>;text-decoration:none;"><?php echo $p_; ?></a>
+                <?php endfor; ?>
+            </div>
+            <?php endif; ?>
+        </div>
+
+        <div style="background:#fff;border:1px solid #ddd;border-radius:8px;overflow:hidden;">
+            <table class="wp-list-table widefat fixed" style="border:none;">
+                <thead>
+                    <tr style="background:#f9f9f9;">
+                        <th style="width:50px;padding:12px;">ID</th>
+                        <th style="width:70px;padding:12px;">画像</th>
+                        <th style="padding:12px;">商品名 / 型番</th>
+                        <th style="width:100px;padding:12px;">受注状態</th>
+                        <th style="width:90px;padding:12px;">LINE送信</th>
+                        <th style="padding:12px;width:160px;">受信日時</th>
+                        <th style="width:220px;padding:12px;">操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php foreach ($orders as $o):
+                    $ost     = $order_statuses[$o->order_status] ?? array('label'=>$o->order_status,'color'=>'#888');
+                    $lst     = $line_statuses[$o->line_status]   ?? array('label'=>$o->line_status,'color'=>'#888');
+                    $thumb   = $o->img_url ? wp_get_attachment_image( (int)$o->img_id, array(60,60) ) : '';
+                ?>
+                <tr id="lo-row-<?php echo $o->id; ?>" style="border-bottom:1px solid #f0f0f0;">
+                    <td style="padding:12px;color:#999;font-size:12px;"><?php echo $o->id; ?></td>
+                    <td style="padding:8px 12px;">
+                        <?php if ($thumb): ?>
+                        <div style="width:56px;height:56px;border-radius:6px;overflow:hidden;border:1px solid #e0e0e0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;">
+                            <?php echo $thumb; ?>
+                        </div>
+                        <?php else: ?>
+                        <div style="width:56px;height:56px;border-radius:6px;border:1px dashed #ccc;display:flex;align-items:center;justify-content:center;background:#fafafa;">
+                            <span class="dashicons dashicons-format-image" style="color:#ccc;font-size:22px;width:22px;height:22px;"></span>
+                        </div>
+                        <?php endif; ?>
+                    </td>
+                    <td style="padding:12px;">
+                        <div style="font-weight:700;font-size:14px;color:#222;"><?php echo esc_html($o->product_name); ?></div>
+                        <div style="margin-top:4px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                            <?php if ($o->group_label): ?>
+                            <span style="font-size:11px;color:#888;"><?php echo esc_html($o->group_label); ?></span>
+                            <span style="color:#ccc;">›</span>
+                            <?php endif; ?>
+                            <code style="background:#f0f6ff;border:1px solid #c8dff8;border-radius:4px;padding:2px 8px;font-size:13px;font-weight:700;color:#0073aa;"><?php echo esc_html($o->model_number); ?></code>
+                            <?php if ($o->model_label): ?>
+                            <span style="font-size:12px;color:#555;"><?php echo esc_html($o->model_label); ?></span>
+                            <?php endif; ?>
+                        </div>
+                    </td>
+                    <td style="padding:12px;">
+                        <select class="lo-status-sel" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>"
+                                style="font-size:12px;padding:3px 6px;border-radius:4px;border:2px solid <?php echo $ost['color']; ?>;color:<?php echo $ost['color']; ?>;font-weight:700;background:#fff;max-width:100%;">
+                            <?php foreach ($order_statuses as $k=>$v): ?>
+                            <option value="<?php echo $k; ?>" <?php selected($o->order_status,$k); ?>><?php echo $v['label']; ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </td>
+                    <td style="padding:12px;">
+                        <span class="lo-line-badge-<?php echo $o->id; ?>" style="display:inline-block;background:<?php echo $lst['color']; ?>22;color:<?php echo $lst['color']; ?>;border:1px solid <?php echo $lst['color']; ?>55;border-radius:20px;padding:2px 10px;font-size:11px;font-weight:700;">
+                            <?php echo $lst['label']; ?>
+                        </span>
+                    </td>
+                    <td style="padding:12px;font-size:12px;color:#555;"><?php echo esc_html($o->created_at); ?></td>
+                    <td style="padding:12px;">
+                        <div style="display:flex;flex-wrap:wrap;gap:4px;">
+                            <!-- 詳細ボタン -->
+                            <button type="button" class="button button-small lo-detail-btn" data-id="<?php echo $o->id; ?>"
+                                    style="font-size:11px;display:inline-flex;align-items:center;gap:3px;">
+                                <span class="dashicons dashicons-visibility" style="font-size:13px;width:13px;height:13px;"></span>詳細
+                            </button>
+                            <!-- LINE再送信 -->
+                            <button type="button" class="button button-small lo-resend-btn" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>"
+                                    style="font-size:11px;display:inline-flex;align-items:center;gap:3px;color:#00B900;border-color:#00B900;">
+                                <span class="dashicons dashicons-update" style="font-size:13px;width:13px;height:13px;"></span>再送信
+                            </button>
+                            <!-- 削除 -->
+                            <button type="button" class="button button-small lo-delete-btn" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>"
+                                    style="font-size:11px;display:inline-flex;align-items:center;gap:3px;color:#dc3545;border-color:#dc3545;">
+                                <span class="dashicons dashicons-trash" style="font-size:13px;width:13px;height:13px;"></span>削除
+                            </button>
+                        </div>
+                    </td>
+                </tr>
+                <!-- 詳細行（初期非表示） -->
+                <tr id="lo-detail-<?php echo $o->id; ?>" style="display:none;background:#f9fafb;">
+                    <td colspan="7" style="padding:16px 20px;">
+                        <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap;">
+                            <?php if ($o->img_url): ?>
+                            <div style="flex-shrink:0;">
+                                <div style="font-weight:700;color:#555;font-size:12px;margin-bottom:6px;">🖼 商品画像</div>
+                                <div style="width:120px;height:120px;border-radius:8px;overflow:hidden;border:1px solid #e0e0e0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;">
+                                    <img src="<?php echo esc_url($o->img_url); ?>" alt="<?php echo esc_attr($o->product_name); ?>"
+                                         style="max-width:100%;max-height:100%;object-fit:contain;display:block;"/>
+                                </div>
+                            </div>
+                            <?php endif; ?>
+                            <div style="flex:1;min-width:260px;">
+                                <div style="font-weight:700;color:#333;margin-bottom:10px;font-size:13px;">📋 LINEメッセージ内容</div>
+                                <pre style="background:#f5f5f5;border:1px solid #ddd;border-radius:6px;padding:12px;font-size:13px;line-height:1.7;white-space:pre-wrap;color:#333;margin:0;"><?php echo esc_html($o->line_message); ?></pre>
+                            </div>
+                        </div>
+                    </td>
+                </tr>
+                <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php endif; ?>
+    </div>
+
+    <style>
+    .lo-status-sel option[value="new"]        { color:#2271b1; }
+    .lo-status-sel option[value="processing"] { color:#f0b429; }
+    .lo-status-sel option[value="done"]       { color:#00B900; }
+    .lo-status-sel option[value="cancelled"]  { color:#dc3545; }
+    </style>
+
+    <script>
+    (function($){
+        var ajaxUrl = '<?php echo admin_url('admin-ajax.php'); ?>';
+
+        /* ステータス変更 */
+        $(document).on('change', '.lo-status-sel', function(){
+            var $sel   = $(this);
+            var oid    = $sel.data('id');
+            var nonce  = $sel.data('nonce');
+            var status = $sel.val();
+            var colors = { new:'#2271b1', processing:'#f0b429', done:'#00B900', cancelled:'#dc3545' };
+            $.post(ajaxUrl, { action:'lo_update_order_status', order_id:oid, status:status, nonce:nonce })
+                .done(function(res){
+                    if (res.success) {
+                        $sel.css({ borderColor: colors[status]||'#ccc', color: colors[status]||'#333' });
+                    }
+                });
+        });
+
+        /* 詳細トグル */
+        $(document).on('click', '.lo-detail-btn', function(){
+            var id  = $(this).data('id');
+            var $tr = $('#lo-detail-' + id);
+            $tr.toggle();
+            $(this).find('.dashicons').toggleClass('dashicons-visibility dashicons-hidden');
+        });
+
+        /* LINE再送信 */
+        $(document).on('click', '.lo-resend-btn', function(){
+            var $btn  = $(this);
+            var oid   = $btn.data('id');
+            var nonce = $btn.data('nonce');
+            $btn.prop('disabled', true).text('送信中...');
+            $.post(ajaxUrl, { action:'lo_resend_line', order_id:oid, nonce:nonce })
+                .done(function(res){
+                    var $badge = $('.lo-line-badge-' + oid);
+                    if (res.success) {
+                        $badge.text('送信済').css({ color:'#00B900', borderColor:'#00B90055', background:'#00B90022' });
+                        alert('LINE再送信しました。');
+                    } else {
+                        $badge.text('失敗').css({ color:'#dc3545', borderColor:'#dc354555', background:'#dc354522' });
+                        alert('失敗: ' + res.data);
+                    }
+                })
+                .always(function(){
+                    $btn.prop('disabled', false).html('<span class="dashicons dashicons-update" style="font-size:13px;width:13px;height:13px;"></span>再送信');
+                });
+        });
+
+        /* 削除 */
+        $(document).on('click', '.lo-delete-btn', function(){
+            if (!confirm('この発注を削除しますか？')) return;
+            var $btn  = $(this);
+            var oid   = $btn.data('id');
+            var nonce = $btn.data('nonce');
+            $.post(ajaxUrl, { action:'lo_delete_order', order_id:oid, nonce:nonce })
+                .done(function(res){
+                    if (res.success) {
+                        $('#lo-row-' + oid).fadeOut(300, function(){ $(this).remove(); });
+                        $('#lo-detail-' + oid).remove();
+                    }
+                });
+        });
+    })(jQuery);
+    </script>
     <?php
 }
 

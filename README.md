@@ -1,1 +1,3 @@
-# Line-order-plugin
+# LINE 発注用プラグイン
+``line-order-plugin``のフォルダを作成し<br>
+FTPから``wordpress/wp-content/plugins/``に保存する
