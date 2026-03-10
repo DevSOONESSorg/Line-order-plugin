@@ -1,1 +1,1 @@
-# Line-order-plugin
+# Lin発注 プラグイン
