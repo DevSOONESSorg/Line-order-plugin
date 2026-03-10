@@ -129,24 +129,27 @@ function lo_ajax_submit() {
     check_ajax_referer('lo_front','nonce');
     $pid = absint( $_POST['post_id'] ?? 0 );
     if ( !$pid || get_post_type($pid) !== 'lo_product' ) wp_send_json_error('無効なリクエストです。');
-    $selected = array();
-    if ( !empty($_POST['lo_selected']) && is_array($_POST['lo_selected']) ) {
-        foreach ( $_POST['lo_selected'] as $gi => $m ) $selected[absint($gi)] = sanitize_text_field($m);
-    }
-    if ( empty($selected) ) wp_send_json_error('型番を選択してください。');
-    $lines   = array('【LINE発注】', '商品名：'.get_the_title($pid), '選択型番：');
-    $groups  = get_post_meta($pid,'_lo_groups',true);
+    /* 選択された型番を1件受け取る */
+    $selected_model = isset($_POST['lo_selected_model']) ? sanitize_text_field($_POST['lo_selected_model']) : '';
+    if ( empty($selected_model) ) wp_send_json_error('型番を選択してください。');
+
+    $lines  = array('【LINE発注】', '商品名：'.get_the_title($pid), '選択型番：');
+    $groups = get_post_meta($pid,'_lo_groups',true);
+    /* グループを検索して一致するラベルを見つける */
     if ( is_array($groups) ) {
+        $found = false;
         foreach ( $groups as $gi => $g ) {
-            if ( !isset($selected[$gi]) ) continue;
-            $lbl = !empty($g['label']) ? $g['label'] : 'グループ'.($gi+1);
-            $mdl = $selected[$gi];
-            $ol  = '';
             foreach ( ($g['options']??array()) as $o ) {
-                if ( ($o['model']??'') === $mdl ) { $ol = !empty($o['label']) ? '（'.$o['label'].'）' : ''; break; }
+                if ( ($o['model']??'') === $selected_model ) {
+                    $lbl     = !empty($g['label']) ? $g['label'] : 'グループ'.($gi+1);
+                    $ol      = !empty($o['label'])  ? '（'.$o['label'].'）' : '';
+                    $lines[] = '  ・'.$lbl.'：'.$selected_model.$ol;
+                    $found   = true;
+                    break 2;
+                }
             }
-            $lines[] = '  ・'.$lbl.'：'.$mdl.$ol;
         }
+        if (!$found) $lines[] = '  ・'.$selected_model;
     }
     $lines[] = '';
     $lines[] = '送信日時：'.wp_date('Y/m/d H:i',null,new DateTimeZone('Asia/Tokyo'));
@@ -611,7 +614,7 @@ function lo_front_css() { ?>
 .lo-ctitle{font-size:15px;font-weight:700;color:#222;margin:0;cursor:pointer}
 .lo-ci-bottom{display:flex;align-items:center;gap:8px;margin-left:32px;min-height:30px}
 .lo-mlbl{font-size:12px;color:#666;flex-shrink:0}
-.lo-mnum{color:#0073aa;font-family:'Consolas','Courier New',monospace;font-size:13px;font-weight:600}
+.lo-mnum{color:#0073aa;font-family:'Consolas','Courier New',monospace;font-size:17px;font-weight:700;letter-spacing:.03em}
 .lo-cpbtn{flex-shrink:0;background:#fff;border:2px solid #00B900;border-radius:20px;padding:4px 14px;font-size:12px;font-weight:700;color:#00B900;cursor:pointer;white-space:nowrap;box-shadow:0 3px 10px rgba(0,185,0,.2);line-height:1.6}
 .lo-cpbtn:hover{background:#00B900;color:#fff}
 .lo-cdet{margin-top:8px;font-size:12px;color:#666;line-height:1.6;background:#f9f9f9;border-radius:4px;padding:6px 8px;margin-left:32px}
@@ -633,9 +636,8 @@ function lo_front_js() { ?>
 /* ラジオ選択 → 同グループリセット → 選択カードをハイライト＋コピーボタン表示 */
 function loSelectCard(radio) {
     var wrap = radio.closest('.lo-wrap');
-    var name = radio.name;
-    /* 同グループを全リセット */
-    var all = wrap.querySelectorAll('input[name="' + name + '"]');
+    /* wrap内の全ラジオをリセット（グループをまたいで1択） */
+    var all = wrap.querySelectorAll('input.lo-radio');
     for (var i = 0; i < all.length; i++) {
         var ci = all[i].closest('.lo-ci');
         ci.style.borderColor = '';
@@ -706,26 +708,12 @@ function loSubmit(pid) {
     var $b = jQuery('[data-pid="'+pid+'"].lo-sbtn');
     var $w = jQuery('#lo-w-'+pid);
     var $r = jQuery('#lo-r-'+pid);
-    var sel = {}, has = false, gn = {};
-    $w.find('.lo-radio').each(function(){
-        var nm = this.name;
-        if (!gn[nm]) gn[nm] = [];
-        gn[nm].push(this);
-    });
-    jQuery.each(gn, function(nm, rr){
-        var ck = rr.filter(function(r){ return r.checked; });
-        if (ck.length > 0) {
-            has = true;
-            var m = nm.match(/\[(\d+)\]/);
-            if (m) sel[m[1]] = ck[0].value;
-        }
-    });
-    if (!has) { loShowMsg($r, 'ng', '型番を選択してください。'); return; }
+    var checked = $w.find('input.lo-radio:checked')[0];
+    if (!checked) { loShowMsg($r, 'ng', '型番を選択してください。'); return; }
     var ot = jQuery.trim($b.text());
     $b.prop('disabled', true).text('送信中...');
     $r.removeClass('ok ng').text('');
-    var d = { action:'lo_submit', nonce:loFront.nonce, post_id:pid };
-    jQuery.each(sel, function(gi, mv){ d['lo_selected['+gi+']'] = mv; });
+    var d = { action:'lo_submit', nonce:loFront.nonce, post_id:pid, lo_selected_model:checked.value };
     jQuery.post(loFront.ajax_url, d)
         .done(function(res){
             if (res.success) loShowMsg($r, 'ok', res.data||'送信しました。');
@@ -793,7 +781,7 @@ function lo_shortcode($atts) {
                                 <div class="lo-ci-top">
                                     <input type="radio" class="lo-radio"
                                            id="<?php echo $rid; ?>"
-                                           name="lo_selected[<?php echo (int)$gi; ?>]"
+                                           name="lo_selected_<?php echo $pid; ?>"
                                            value="<?php echo esc_attr($om); ?>"
                                            onclick="loSelectCard(this)"/>
                                     <?php if ($ol): ?>
