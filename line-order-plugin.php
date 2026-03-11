@@ -1553,7 +1553,6 @@ function loSubmit(pid) {
                 lineMessages.push({ type:'image', originalContentUrl:d.img_url, previewImageUrl:d.img_url });
             }
             lineMessages.push({ type:'text', text:d.message });
-
             loSendViaLiff(lineMessages, function(sent) {
                 jQuery.post(loFront.ajax_url, {
                     action:'lo_liff_sent', nonce:loFront.nonce,
@@ -1565,6 +1564,10 @@ function loSubmit(pid) {
                     loShowMsg($r, 'ng', '発注を保存しましたが、LINE送信に失敗しました。管理画面から再送信できます。');
                 }
                 $b.prop('disabled', false).text(origText);
+                /* メッセージを表示してから3秒後にLIFFウィンドウを閉じる */
+                if (sent && liff.isInClient()) {
+                    setTimeout(function(){ liff.closeWindow(); }, 3000);
+                }
             });
         })
         .fail(function() {
