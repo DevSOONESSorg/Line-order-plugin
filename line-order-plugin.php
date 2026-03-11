@@ -2,8 +2,8 @@
 /**
  * Plugin Name: LINE発注
  * Plugin URI:  https://example.com
- * Description: 商品情報を管理し、LINE公式アカウントへ発注内容を送信するプラグイン
- * Version:     1.0.0
+ * Description: 商品情報を管理し、LIFFアプリ経由でLINEへ発注内容を送信するプラグイン
+ * Version:     2.1.0
  * Author:      Custom Plugin
  * License:     GPL2
  * Text Domain: line-order
@@ -13,9 +13,12 @@
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-define( 'LO_VERSION', '1.0.0' );
+define( 'LO_VERSION', '2.1.0' );
 define( 'LO_URL',     plugin_dir_url( __FILE__ ) );
 
+/* ============================================================
+   カスタム投稿タイプ（v1.0 そのまま）
+============================================================ */
 add_action( 'init', 'lo_register_post_type' );
 function lo_register_post_type() {
     register_post_type( 'lo_product', array(
@@ -66,9 +69,9 @@ register_activation_hook( __FILE__, function() {
     flush_rewrite_rules();
 } );
 
-/* =========================================================
-   DB TABLE
-========================================================= */
+/* ============================================================
+   発注履歴テーブル（v1.0 そのまま）
+============================================================ */
 function lo_create_orders_table() {
     global $wpdb;
     $table   = $wpdb->prefix . 'lo_orders';
@@ -88,26 +91,29 @@ function lo_create_orders_table() {
         created_at   DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at   DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (id),
-        KEY idx_post_id (post_id),
+        KEY idx_post_id      (post_id),
         KEY idx_order_status (order_status),
-        KEY idx_created_at (created_at)
+        KEY idx_created_at   (created_at)
     ) {$charset};";
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     dbDelta( $sql );
     update_option( 'lo_db_version', '1.1' );
 }
+
 add_action( 'plugins_loaded', function() {
     global $wpdb;
     if ( get_option('lo_db_version') !== '1.1' ) {
         lo_create_orders_table();
-        /* 既存テーブルへのカラム追加（アップグレード用） */
         $table = $wpdb->prefix . 'lo_orders';
-        $cols  = $wpdb->get_col("DESC {$table}", 0);
+        $cols  = $wpdb->get_col( "DESC {$table}", 0 );
         if ( !in_array('img_id',  $cols) ) $wpdb->query("ALTER TABLE {$table} ADD img_id  BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER model_number");
         if ( !in_array('img_url', $cols) ) $wpdb->query("ALTER TABLE {$table} ADD img_url TEXT           NOT NULL DEFAULT '' AFTER img_id");
     }
 } );
 
+/* ============================================================
+   管理メニュー（v1.0 そのまま）
+============================================================ */
 add_action( 'admin_menu', 'lo_add_orders_page' );
 function lo_add_orders_page() {
     add_submenu_page(
@@ -125,56 +131,233 @@ function lo_add_settings_page() {
         'lo-settings', 'lo_settings_html'
     );
 }
+
+/* ============================================================
+   設定登録
+   lo_liff_id     … LIFF App ID（フロントの送信に使用）★新規
+   lo_line_token  … Messaging API トークン（管理画面からの再送信用）
+   lo_line_to     … 再送信先 userId / groupId
+============================================================ */
 add_action( 'admin_init', function() {
+    register_setting( 'lo_settings', 'lo_liff_id' );
     register_setting( 'lo_settings', 'lo_line_token' );
     register_setting( 'lo_settings', 'lo_line_to' );
 } );
+
+/* ============================================================
+   LINE設定ページ（LIFF中心 + リッチメニュー手順）
+============================================================ */
 function lo_settings_html() { ?>
 <div class="wrap">
-    <h1>LINE API設定</h1>
+    <h1>LINE 設定</h1>
+    <?php if ( isset($_GET['settings-updated']) ) : ?>
+    <div style="background:#d4edda;border:1px solid #c3e6cb;color:#155724;border-radius:6px;padding:10px 14px;margin-bottom:14px;">✓ 設定を保存しました。</div>
+    <?php endif; ?>
+
     <form method="post" action="options.php">
-        <?php settings_fields( 'lo_settings' ); ?>
-        <table class="form-table">
-            <tr>
-                <th>チャネルアクセストークン</th>
-                <td><input type="text" name="lo_line_token"
-                    value="<?php echo esc_attr( get_option('lo_line_token') ); ?>"
-                    class="regular-text" placeholder="LINE チャネルアクセストークン"/></td>
-            </tr>
-            <tr>
-                <th>送信先 (userId / groupId)</th>
-                <td><input type="text" name="lo_line_to"
-                    value="<?php echo esc_attr( get_option('lo_line_to') ); ?>"
-                    class="regular-text" placeholder="U1234567890abcdef..."/></td>
-            </tr>
-        </table>
+        <?php settings_fields('lo_settings'); ?>
+
+        <!-- ========== LIFF 設定 ========== -->
+        <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:20px 24px;max-width:700px;margin-bottom:20px;">
+            <h2 style="margin:0 0 4px;font-size:16px;display:flex;align-items:center;gap:8px;">
+                <span style="background:#06C755;color:#fff;border-radius:6px;padding:2px 12px;font-size:13px;font-weight:700;">LIFF</span>
+                LIFF 設定（発注フォームの連携）
+            </h2>
+            <p style="font-size:13px;color:#666;margin:6px 0 16px;">
+                ユーザーが LINE アプリ内のリッチメニューから発注ページを開き、ラジオボタンで型番を選んで送信ボタンを押すと、
+                そのトーク画面（個人・グループ・公式アカウントどこでも）に商品画像＋発注テキストが送信されます。
+            </p>
+
+            <div style="margin-bottom:14px;">
+                <label style="display:block;font-weight:600;font-size:13px;margin-bottom:5px;">LIFF App ID <span style="color:#dc3545;">*</span></label>
+                <input type="text" name="lo_liff_id"
+                       value="<?php echo esc_attr( get_option('lo_liff_id') ); ?>"
+                       style="width:100%;max-width:480px;" class="regular-text"
+                       placeholder="1234567890-AbCdEfGh"/>
+                <p class="description">LINE Developers → チャンネル → LIFF タブ → LIFF ID をコピーして貼り付けます。</p>
+            </div>
+
+            <!-- LIFF 作成手順 -->
+            <details style="margin-bottom:14px;">
+                <summary style="cursor:pointer;font-weight:700;font-size:13px;color:#2271b1;padding:8px 0;">
+                    📋 LIFF アプリの作成手順（クリックして展開）
+                </summary>
+                <div style="background:#f0f8ff;border:1px solid #b3d4f5;border-radius:6px;padding:14px 16px;font-size:13px;line-height:1.9;margin-top:8px;">
+                    <strong>① LINE Developers でチャンネルを用意する</strong><br>
+                    1. <a href="https://developers.line.biz/console/" target="_blank" style="color:#06C755;">LINE Developers コンソール</a> にログイン<br>
+                    2. プロバイダーを選択（なければ「作成」）<br>
+                    3. 「チャンネル作成」→ <strong>Messaging API</strong> を選択して作成<br><br>
+
+                    <strong>② LIFF アプリを追加する</strong><br>
+                    4. 作成したチャンネルを開き「LIFF」タブをクリック<br>
+                    5. 「追加」ボタン → 以下を入力：<br>
+                    &emsp;・<strong>LIFFアプリ名</strong>：任意（例：発注フォーム）<br>
+                    &emsp;・<strong>サイズ</strong>：<code>Full</code>（推奨）<br>
+                    &emsp;・<strong>エンドポイントURL</strong>：発注ページの URL<br>
+                    &emsp;&emsp;例：<code>https://example.com/order-page/</code><br>
+                    &emsp;・<strong>Scope</strong>：<code>chat_message.write</code> に ✓<br>
+                    &emsp;&emsp;（sendMessages でトーク送信するために必須）<br>
+                    &emsp;・<strong>ボットリンク機能</strong>：On（推奨）<br>
+                    6. 「追加」後に発行された <strong>LIFF ID</strong> をコピー<br>
+                    &emsp;例：<code>1234567890-AbCdEfGh</code><br><br>
+
+                    <strong>③ LIFF URL について</strong><br>
+                    7. LIFF URL は <code>https://liff.line.me/<strong>{LIFF_ID}</strong></code> の形式です<br>
+                    8. この URL をリッチメニューに設定すれば完成です（下の手順参照）
+                </div>
+            </details>
+
+            <div style="background:#fff8e1;border:1px solid #ffe082;border-radius:6px;padding:10px 14px;font-size:12px;color:#795548;">
+                ⚠️ <strong>動作条件：</strong>
+                トークから開いた場合は <code>liff.sendMessages()</code> で直接送信。
+                LINEアプリ内だがトーク外から開いた場合は <code>shareTargetPicker()</code> で送信先を選択。
+                通常ブラウザからは送信できません（LIFF URLへの案内を表示します）。
+            </div>
+        </div>
+
+        <!-- ========== リッチメニュー設定手順 ========== -->
+        <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:20px 24px;max-width:700px;margin-bottom:20px;">
+            <h2 style="margin:0 0 4px;font-size:16px;display:flex;align-items:center;gap:8px;">
+                <span style="background:#FF6B00;color:#fff;border-radius:6px;padding:2px 12px;font-size:13px;font-weight:700;">MENU</span>
+                リッチメニューに発注ページを設定する手順
+            </h2>
+            <p style="font-size:13px;color:#666;margin:6px 0 16px;">
+                LINE 公式アカウントのリッチメニューに LIFF URL を設定することで、
+                ユーザーがトーク画面下のメニューボタンをタップするだけで発注フォームを開けるようになります。
+            </p>
+
+            <div style="font-size:13px;line-height:1.9;">
+
+                <div style="background:#f9f9f9;border-left:4px solid #06C755;border-radius:0 6px 6px 0;padding:12px 16px;margin-bottom:12px;">
+                    <strong>方法 A：LINE Official Account Manager（管理画面）で設定</strong><br>
+                    ※ 小規模・無料プランにおすすめ
+                    <ol style="margin:8px 0 0;padding-left:20px;">
+                        <li><a href="https://manager.line.biz/" target="_blank" style="color:#06C755;">LINE Official Account Manager</a> にログイン</li>
+                        <li>対象アカウントを選択 → 左メニュー「チャットUI」→「リッチメニュー」</li>
+                        <li>「作成」ボタン → タイトル・表示期間を入力</li>
+                        <li>テンプレートを選択してメニューボタンを配置</li>
+                        <li>各ボタンの「アクション」を「リンク」に設定</li>
+                        <li>URLに <code>https://liff.line.me/<strong><?php echo esc_html(get_option('lo_liff_id') ?: 'YOUR_LIFF_ID'); ?></strong></code> を入力</li>
+                        <li>ラベル（例：「発注する」）を入力して「保存」→「公開」</li>
+                    </ol>
+                </div>
+
+                <div style="background:#f9f9f9;border-left:4px solid #2271b1;border-radius:0 6px 6px 0;padding:12px 16px;margin-bottom:12px;">
+                    <strong>方法 B：Messaging API（プログラム）で設定</strong><br>
+                    ※ 複数商品ページを切り替えたい場合や自動化したい場合
+                    <ol style="margin:8px 0 0;padding-left:20px;">
+                        <li>LINE Developers → Messaging API → チャネルアクセストークン（長期）を取得</li>
+                        <li>以下の API を呼び出してリッチメニューを作成：</li>
+                    </ol>
+                    <pre style="background:#1e1e2e;color:#cdd6f4;border-radius:6px;padding:12px;font-size:12px;overflow-x:auto;margin:8px 0;line-height:1.6;">POST https://api.line.me/v2/bot/richmenu
+Authorization: Bearer {チャネルアクセストークン}
+Content-Type: application/json
+
+{
+  "size": { "width": 2500, "height": 843 },
+  "selected": true,
+  "name": "発注メニュー",
+  "chatBarText": "発注する",
+  "areas": [
+    {
+      "bounds": { "x":0, "y":0, "width":2500, "height":843 },
+      "action": {
+        "type": "uri",
+        "label": "発注する",
+        "uri": "https://liff.line.me/<?php echo esc_html(get_option('lo_liff_id') ?: 'YOUR_LIFF_ID'); ?>"
+      }
+    }
+  ]
+}</pre>
+                    <ol start="3" style="margin:0;padding-left:20px;">
+                        <li>レスポンスの <code>richMenuId</code> を使ってデフォルトメニューに設定：<br>
+                            <code>POST /v2/bot/user/all/richmenu/{richMenuId}</code></li>
+                        <li>メニュー画像をアップロード：<br>
+                            <code>POST https://api-data.line.me/v2/bot/richmenu/{richMenuId}/content</code></li>
+                    </ol>
+                </div>
+
+                <div style="background:#fff0f0;border:1px solid #f5c6cb;border-radius:6px;padding:10px 14px;font-size:12px;color:#721c24;">
+                    💡 <strong>複数商品ページがある場合：</strong>
+                    LIFF アプリを商品ページごとに作成するか、1つの LIFF URL に商品IDをパラメータとして付与することもできます。
+                    例：<code>https://liff.line.me/{LIFF_ID}?pid=123</code>（ページ側でクエリパラメータを読み取る実装が必要）
+                </div>
+            </div>
+        </div>
+
+        <!-- ========== Messaging API（再送信用） ========== -->
+        <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:20px 24px;max-width:700px;margin-bottom:20px;">
+            <h2 style="margin:0 0 4px;font-size:16px;display:flex;align-items:center;gap:8px;">
+                <span style="background:#777;color:#fff;border-radius:6px;padding:2px 12px;font-size:13px;font-weight:700;">API</span>
+                Messaging API 設定（管理画面からの再送信用・任意）
+            </h2>
+            <p style="font-size:13px;color:#666;margin:6px 0 16px;">
+                発注履歴ページの「再送信」ボタンで使用します。LIFF 経由の送信が主な方法のためこちらは任意です。
+            </p>
+            <div style="margin-bottom:14px;">
+                <label style="display:block;font-weight:600;font-size:13px;margin-bottom:5px;">チャネルアクセストークン（長期）</label>
+                <input type="text" name="lo_line_token"
+                       value="<?php echo esc_attr( get_option('lo_line_token') ); ?>"
+                       class="regular-text" style="width:100%;max-width:480px;"
+                       placeholder="LINE チャネルアクセストークンを貼り付け"/>
+            </div>
+            <div style="margin-bottom:0;">
+                <label style="display:block;font-weight:600;font-size:13px;margin-bottom:5px;">再送信先 ID（userId または groupId）</label>
+                <input type="text" name="lo_line_to"
+                       value="<?php echo esc_attr( get_option('lo_line_to') ); ?>"
+                       class="regular-text" style="width:100%;max-width:480px;"
+                       placeholder="Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"/>
+                <p class="description">
+                    <strong>個人LINE：</strong>LINE Developers → ボット基本設定 → Your user ID<br>
+                    <strong>グループ：</strong>Webhook で受信した groupId
+                </p>
+            </div>
+        </div>
+
         <?php submit_button('設定を保存'); ?>
     </form>
 </div>
 <?php }
 
-function lo_send_line( $message ) {
+/* ============================================================
+   Messaging API 送信（管理画面からの再送信のみで使用）
+============================================================ */
+function lo_send_line( $message, $img_url = '' ) {
     $token = get_option('lo_line_token','');
     $to    = get_option('lo_line_to','');
     if ( empty($token) ) return array('success'=>false,'message'=>'LINEトークンが未設定です。');
     if ( empty($to) )    return array('success'=>false,'message'=>'送信先が未設定です。');
+
+    $messages = array();
+    if ( !empty($img_url) ) {
+        $https_url  = preg_replace('/^http:/', 'https:', $img_url);
+        $messages[] = array(
+            'type'               => 'image',
+            'originalContentUrl' => $https_url,
+            'previewImageUrl'    => $https_url,
+        );
+    }
+    $messages[] = array( 'type' => 'text', 'text' => $message );
+
     $res = wp_remote_post( 'https://api.line.me/v2/bot/message/push', array(
         'timeout' => 15,
         'headers' => array(
             'Content-Type'  => 'application/json',
             'Authorization' => 'Bearer ' . $token,
         ),
-        'body' => wp_json_encode( array(
-            'to'       => $to,
-            'messages' => array( array('type'=>'text','text'=>$message) ),
-        ) ),
+        'body' => wp_json_encode( array( 'to' => $to, 'messages' => $messages ) ),
     ) );
     if ( is_wp_error($res) ) return array('success'=>false,'message'=>$res->get_error_message());
-    $code = wp_remote_retrieve_response_code($res);
+    $code = (int) wp_remote_retrieve_response_code($res);
     if ( $code === 200 ) return array('success'=>true,'message'=>'送信成功');
     return array('success'=>false,'message'=>'LINE APIエラー('.$code.'): '.wp_remote_retrieve_body($res));
 }
 
+/* ============================================================
+   AJAX: 注文送信
+   ★変更点: LINE push 廃止 → DB保存(pending) + メッセージデータ返却
+   　フロントエンドの LIFF SDK が sendMessages() する
+============================================================ */
 add_action('wp_ajax_lo_submit',        'lo_ajax_submit');
 add_action('wp_ajax_nopriv_lo_submit', 'lo_ajax_submit');
 function lo_ajax_submit() {
@@ -184,7 +367,7 @@ function lo_ajax_submit() {
     $pid = absint( $_POST['post_id'] ?? 0 );
     if ( !$pid || get_post_type($pid) !== 'lo_product' ) wp_send_json_error('無効なリクエストです。');
 
-    $selected_model = isset($_POST['lo_selected_model']) ? sanitize_text_field($_POST['lo_selected_model']) : '';
+    $selected_model = sanitize_text_field( $_POST['lo_selected_model'] ?? '' );
     if ( empty($selected_model) ) wp_send_json_error('型番を選択してください。');
 
     $product_name = get_the_title($pid);
@@ -193,8 +376,8 @@ function lo_ajax_submit() {
     $groups = get_post_meta($pid,'_lo_groups',true);
     if ( is_array($groups) ) {
         foreach ( $groups as $gi => $g ) {
-            foreach ( ($g['options']??array()) as $o ) {
-                if ( ($o['model']??'') === $selected_model ) {
+            foreach ( ($g['options'] ?? array()) as $o ) {
+                if ( ($o['model'] ?? '') === $selected_model ) {
                     $group_label = !empty($g['label']) ? $g['label'] : 'グループ'.($gi+1);
                     $model_label = $o['label'] ?? '';
                     break 2;
@@ -203,12 +386,13 @@ function lo_ajax_submit() {
         }
     }
 
-    /* 画像情報を取得 */
     $img_id  = (int) get_post_meta($pid,'_lo_img_id',true);
     $img_url = $img_id ? (string) wp_get_attachment_url($img_id) : '';
 
-    $now     = wp_date('Y/m/d H:i', null, new DateTimeZone('Asia/Tokyo'));
-    $detail  = ( $group_label ? $group_label . '：' : '' ) . $selected_model . ( $model_label ? '（'.$model_label.'）' : '' );
+    $now    = wp_date('Y/m/d H:i', null, new DateTimeZone('Asia/Tokyo'));
+    $detail = ( $group_label ? $group_label . '：' : '' )
+              . $selected_model
+              . ( $model_label ? '（'.$model_label.'）' : '' );
     $message = implode("\n", array(
         '【LINE発注】',
         '商品名：'   . $product_name,
@@ -217,13 +401,8 @@ function lo_ajax_submit() {
         '送信日時：' . $now,
     ));
 
-    /* LINE送信 */
-    $r_line      = lo_send_line( $message );
-    $line_status = $r_line['success'] ? 'sent' : 'failed';
-
-    /* DB保存 */
-    $table = $wpdb->prefix . 'lo_orders';
-    $wpdb->insert( $table, array(
+    /* DB に pending で保存（LIFF 送信完了後に lo_liff_sent で更新） */
+    $wpdb->insert( $wpdb->prefix.'lo_orders', array(
         'post_id'      => $pid,
         'product_name' => $product_name,
         'group_label'  => $group_label,
@@ -231,21 +410,48 @@ function lo_ajax_submit() {
         'model_number' => $selected_model,
         'img_id'       => $img_id,
         'img_url'      => $img_url,
-        'line_status'  => $line_status,
+        'line_status'  => 'pending',
         'order_status' => 'new',
         'line_message' => $message,
     ), array('%d','%s','%s','%s','%s','%d','%s','%s','%s','%s') );
+    $order_id = (int) $wpdb->insert_id;
 
-    if ( $r_line['success'] ) {
-        wp_send_json_success('ご注文を受け付けました。LINEへ送信しました。');
-    } else {
-        wp_send_json_error('発注を保存しましたが、LINE送信に失敗しました: ' . $r_line['message']);
-    }
+    $img_https = $img_url ? preg_replace('/^http:/', 'https:', $img_url) : '';
+
+    /* フロントの LIFF sendMessages 用にデータを返す */
+    wp_send_json_success( array(
+        'order_id'  => $order_id,
+        'message'   => $message,
+        'img_url'   => $img_https,
+        'has_image' => !empty($img_https),
+    ) );
 }
 
-/* =========================================================
-   ORDER STATUS UPDATE AJAX (管理画面用)
-========================================================= */
+/* ============================================================
+   AJAX: LIFF 送信完了後に line_status を更新
+============================================================ */
+add_action('wp_ajax_lo_liff_sent',        'lo_ajax_liff_sent');
+add_action('wp_ajax_nopriv_lo_liff_sent', 'lo_ajax_liff_sent');
+function lo_ajax_liff_sent() {
+    check_ajax_referer('lo_front','nonce');
+    global $wpdb;
+    $oid    = absint( $_POST['order_id'] ?? 0 );
+    $result = sanitize_text_field( $_POST['result'] ?? '' );
+    $status = ( $result === 'sent' ) ? 'sent_liff' : 'failed';
+    if ($oid) {
+        $wpdb->update(
+            $wpdb->prefix.'lo_orders',
+            array('line_status' => $status),
+            array('id' => $oid),
+            array('%s'), array('%d')
+        );
+    }
+    wp_send_json_success();
+}
+
+/* ============================================================
+   管理画面 AJAX ハンドラ
+============================================================ */
 add_action('wp_ajax_lo_update_order_status', 'lo_ajax_update_order_status');
 function lo_ajax_update_order_status() {
     check_ajax_referer('lo_admin','nonce');
@@ -253,14 +459,11 @@ function lo_ajax_update_order_status() {
     global $wpdb;
     $oid    = absint( $_POST['order_id'] ?? 0 );
     $status = sanitize_text_field( $_POST['status'] ?? '' );
-    $allowed = array('new','processing','done','cancelled');
-    if ( !$oid || !in_array($status, $allowed) ) wp_send_json_error('不正なリクエストです。');
-    $table = $wpdb->prefix . 'lo_orders';
-    $wpdb->update( $table, array('order_status'=>$status), array('id'=>$oid), array('%s'), array('%d') );
-    wp_send_json_success('ステータスを更新しました。');
+    if ( !$oid || !in_array($status, array('new','processing','done','cancelled')) ) wp_send_json_error('不正なリクエストです。');
+    $wpdb->update( $wpdb->prefix.'lo_orders', array('order_status'=>$status), array('id'=>$oid), array('%s'), array('%d') );
+    wp_send_json_success();
 }
 
-/* LINE再送信 AJAX */
 add_action('wp_ajax_lo_resend_line', 'lo_ajax_resend_line');
 function lo_ajax_resend_line() {
     check_ajax_referer('lo_admin','nonce');
@@ -269,26 +472,26 @@ function lo_ajax_resend_line() {
     $oid   = absint( $_POST['order_id'] ?? 0 );
     $table = $wpdb->prefix . 'lo_orders';
     $order = $wpdb->get_row( $wpdb->prepare("SELECT * FROM {$table} WHERE id=%d", $oid) );
-    if ( !$order ) wp_send_json_error('発注が見つかりません。');
-    $r = lo_send_line( $order->line_message );
-    $status = $r['success'] ? 'sent' : 'failed';
-    $wpdb->update( $table, array('line_status'=>$status), array('id'=>$oid), array('%s'), array('%d') );
+    if (!$order) wp_send_json_error('発注が見つかりません。');
+    $r = lo_send_line( $order->line_message, $order->img_url );
+    $wpdb->update( $table, array('line_status'=>$r['success']?'sent':'failed'), array('id'=>$oid), array('%s'), array('%d') );
     if ($r['success']) wp_send_json_success('LINE再送信しました。');
     else               wp_send_json_error('再送信失敗: '.$r['message']);
 }
 
-/* 削除 AJAX */
 add_action('wp_ajax_lo_delete_order', 'lo_ajax_delete_order');
 function lo_ajax_delete_order() {
     check_ajax_referer('lo_admin','nonce');
     if ( !current_user_can('edit_posts') ) wp_send_json_error('権限がありません。');
     global $wpdb;
-    $oid   = absint( $_POST['order_id'] ?? 0 );
-    $table = $wpdb->prefix . 'lo_orders';
-    $wpdb->delete( $table, array('id'=>$oid), array('%d') );
-    wp_send_json_success('削除しました。');
+    $oid = absint( $_POST['order_id'] ?? 0 );
+    $wpdb->delete( $wpdb->prefix.'lo_orders', array('id'=>$oid), array('%d') );
+    wp_send_json_success();
 }
 
+/* ============================================================
+   管理画面スクリプト（v1.0 そのまま）
+============================================================ */
 add_action('admin_enqueue_scripts','lo_admin_scripts');
 function lo_admin_scripts($hook) {
     global $post_type;
@@ -304,6 +507,10 @@ function lo_admin_scripts($hook) {
         add_action('admin_footer', 'lo_admin_inline_js');
     }
 }
+
+/* ============================================================
+   管理画面インライン CSS（v1.0 そのまま）
+============================================================ */
 function lo_admin_inline_css() { ?>
 <style>
 .lo-box{background:#fff;border:1px solid #ddd;border-radius:8px;padding:18px 20px;margin-bottom:6px}
@@ -351,6 +558,9 @@ function lo_admin_inline_css() { ?>
 </style>
 <?php }
 
+/* ============================================================
+   メタボックス（v1.0 そのまま）
+============================================================ */
 add_action('add_meta_boxes','lo_add_boxes');
 function lo_add_boxes() {
     add_meta_box('lo_img',  '① 商品画像',           'lo_box_img',  'lo_product','normal','high');
@@ -410,8 +620,7 @@ function lo_box_info($post) {
 
 function lo_box_mdl($post) {
     $groups = get_post_meta($post->ID,'_lo_groups',true);
-    if (!is_array($groups)||empty($groups)) $groups = array(array('label'=>'','detail'=>'','options'=>array(array('label'=>'','model'=>''))));
-    ?>
+    if (!is_array($groups)||empty($groups)) $groups = array(array('label'=>'','detail'=>'','options'=>array(array('label'=>'','model'=>'')))); ?>
     <div class="lo-box">
         <p class="description" style="margin-bottom:12px;">グループごとにラベル・型番詳細・ラジオボタン（最大20個）を登録できます。</p>
         <div id="lo_gcon">
@@ -424,8 +633,8 @@ function lo_box_mdl($post) {
 }
 
 function lo_render_group($gi,$g,$tpl=false) {
-    $lbl = $tpl ? '' : esc_attr($g['label']??'');
-    $det = $tpl ? '' : esc_textarea($g['detail']??'');
+    $lbl  = $tpl ? '' : esc_attr($g['label']??'');
+    $det  = $tpl ? '' : esc_textarea($g['detail']??'');
     $opts = (!$tpl&&!empty($g['options'])) ? $g['options'] : array(array('label'=>'','model'=>'')); ?>
     <div class="lo-gb" data-gi="<?php echo $gi; ?>">
         <div class="lo-gh">
@@ -464,9 +673,9 @@ function lo_render_group($gi,$g,$tpl=false) {
 }
 
 function lo_box_btn($post) {
-    $t  = get_post_meta($post->ID,'_lo_btn_text', true) ?: 'ご注文はこちら';
-    $bg = get_post_meta($post->ID,'_lo_btn_bg',   true) ?: '#00B900';
-    $cl = get_post_meta($post->ID,'_lo_btn_col',  true) ?: '#ffffff'; ?>
+    $t  = get_post_meta($post->ID,'_lo_btn_text',true) ?: 'ご注文はこちら';
+    $bg = get_post_meta($post->ID,'_lo_btn_bg',  true) ?: '#00B900';
+    $cl = get_post_meta($post->ID,'_lo_btn_col', true) ?: '#ffffff'; ?>
     <div class="lo-box">
         <div class="lo-frow">
             <label>ボタンテキスト</label>
@@ -492,6 +701,9 @@ function lo_box_btn($post) {
     <?php
 }
 
+/* ============================================================
+   保存処理（v1.0 そのまま）
+============================================================ */
 add_action('save_post_lo_product','lo_save');
 function lo_save($pid) {
     if (!isset($_POST['lo_nonce'])) return;
@@ -527,6 +739,9 @@ function lo_save($pid) {
     if (isset($_POST['lo_btn_col']))  update_post_meta($pid,'_lo_btn_col',  sanitize_hex_color($_POST['lo_btn_col']) ?: '#ffffff');
 }
 
+/* ============================================================
+   ショートコード ボックス／一覧（v1.0 そのまま）
+============================================================ */
 function lo_box_sc($post) {
     $is_new = ($post->post_status === 'auto-draft' || $post->ID == 0); ?>
     <div class="lo-box lo-sc-box">
@@ -583,7 +798,7 @@ function lo_sc_page_html() {
             <p>商品がまだ登録されていません。<a href="<?php echo admin_url('post-new.php?post_type=lo_product'); ?>" class="button button-primary">新規商品を追加</a></p>
         <?php else: ?>
             <div style="background:#e8f4fd;border:1px solid #b3d9f5;border-radius:8px;padding:14px 18px;margin-bottom:24px;font-size:13px;">
-                <strong>使い方：</strong>ショートコードをコピー → 固定ページに貼り付けて更新
+                <strong>使い方：</strong>ショートコードをコピー → 固定ページに貼り付けて更新 → そのページのURLをLIFFエンドポイントURLに設定
             </div>
             <table class="wp-list-table widefat fixed striped">
                 <thead><tr><th style="width:40px;">#</th><th>商品名</th><th style="width:80px;">状態</th><th>ショートコード</th><th style="width:120px;">操作</th></tr></thead>
@@ -617,14 +832,13 @@ function lo_sc_page_html() {
     <?php
 }
 
-/* =========================================================
-   ORDERS PAGE HTML
-========================================================= */
+/* ============================================================
+   発注履歴ページ（v1.0 ベース + sent_liff バッジ追加）
+============================================================ */
 function lo_orders_page_html() {
     global $wpdb;
     $table = $wpdb->prefix . 'lo_orders';
 
-    /* ステータスラベル定義 */
     $order_statuses = array(
         'new'        => array('label'=>'新規',      'color'=>'#2271b1'),
         'processing' => array('label'=>'処理中',    'color'=>'#f0b429'),
@@ -632,12 +846,12 @@ function lo_orders_page_html() {
         'cancelled'  => array('label'=>'キャンセル','color'=>'#dc3545'),
     );
     $line_statuses = array(
-        'sent'   => array('label'=>'送信済', 'color'=>'#00B900'),
-        'failed' => array('label'=>'失敗',   'color'=>'#dc3545'),
-        'pending'=> array('label'=>'未送信', 'color'=>'#999'),
+        'sent_liff' => array('label'=>'LIFF送信済', 'color'=>'#06C755'),
+        'sent'      => array('label'=>'API送信済',  'color'=>'#00B900'),
+        'failed'    => array('label'=>'失敗',        'color'=>'#dc3545'),
+        'pending'   => array('label'=>'未送信',      'color'=>'#999'),
     );
 
-    /* フィルター */
     $filter_status = isset($_GET['lo_status']) ? sanitize_text_field($_GET['lo_status']) : '';
     $filter_pid    = absint($_GET['lo_pid'] ?? 0);
     $page          = max(1, absint($_GET['paged'] ?? 1));
@@ -649,21 +863,15 @@ function lo_orders_page_html() {
     if ($filter_status) { $where .= ' AND order_status=%s'; $params[] = $filter_status; }
     if ($filter_pid)    { $where .= ' AND post_id=%d';      $params[] = $filter_pid; }
 
-    $count_sql = "SELECT COUNT(*) FROM {$table} {$where}";
-    $data_sql  = "SELECT * FROM {$table} {$where} ORDER BY created_at DESC LIMIT %d OFFSET %d";
-
     if ($params) {
-        $count = (int) $wpdb->get_var( $wpdb->prepare($count_sql, ...$params) );
-        $orders = $wpdb->get_results( $wpdb->prepare($data_sql, ...array_merge($params, array($per_page, $offset))) );
+        $count  = (int) $wpdb->get_var( $wpdb->prepare("SELECT COUNT(*) FROM {$table} {$where}", ...$params) );
+        $orders = $wpdb->get_results( $wpdb->prepare("SELECT * FROM {$table} {$where} ORDER BY created_at DESC LIMIT %d OFFSET %d", ...array_merge($params, array($per_page, $offset))) );
     } else {
-        $count  = (int) $wpdb->get_var($count_sql);
+        $count  = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$table}");
         $orders = $wpdb->get_results( $wpdb->prepare("SELECT * FROM {$table} ORDER BY created_at DESC LIMIT %d OFFSET %d", $per_page, $offset) );
     }
     $total_pages = max(1, ceil($count / $per_page));
-
-    /* 商品リスト (フィルター用) */
-    $products = get_posts(array('post_type'=>'lo_product','post_status'=>array('publish','draft'),'posts_per_page'=>-1,'orderby'=>'title','order'=>'ASC'));
-
+    $products    = get_posts(array('post_type'=>'lo_product','post_status'=>array('publish','draft'),'posts_per_page'=>-1,'orderby'=>'title','order'=>'ASC'));
     $admin_nonce = wp_create_nonce('lo_admin');
     $base_url    = admin_url('edit.php?post_type=lo_product&page=lo-orders');
     ?>
@@ -674,7 +882,6 @@ function lo_orders_page_html() {
             <span style="font-size:14px;font-weight:400;color:#666;margin-left:8px;">全 <?php echo $count; ?> 件</span>
         </h1>
 
-        <!-- フィルターバー -->
         <div style="display:flex;gap:10px;align-items:center;margin:16px 0;flex-wrap:wrap;background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px 16px;">
             <form method="get" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;width:100%;">
                 <input type="hidden" name="post_type" value="lo_product"/>
@@ -693,19 +900,16 @@ function lo_orders_page_html() {
                     <option value="<?php echo $p->ID; ?>" <?php selected($filter_pid,$p->ID); ?>><?php echo esc_html($p->post_title); ?></option>
                     <?php endforeach; ?>
                 </select>
-                <button type="submit" class="button" style="font-size:13px;">絞り込み</button>
-                <a href="<?php echo $base_url; ?>" class="button" style="font-size:13px;">リセット</a>
+                <button type="submit" class="button">絞り込み</button>
+                <a href="<?php echo $base_url; ?>" class="button">リセット</a>
             </form>
         </div>
 
         <?php if (empty($orders)): ?>
         <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:40px;text-align:center;color:#888;">
-            <span class="dashicons dashicons-cart" style="font-size:48px;width:48px;height:48px;display:block;margin:0 auto 12px;color:#ccc;"></span>
             <p>発注データがありません。</p>
         </div>
         <?php else: ?>
-
-        <!-- 件数・ページネーション上部 -->
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
             <span style="font-size:13px;color:#666;"><?php echo (($page-1)*$per_page+1); ?>〜<?php echo min($page*$per_page,$count); ?> 件 / 全 <?php echo $count; ?> 件</span>
             <?php if ($total_pages > 1): ?>
@@ -726,41 +930,32 @@ function lo_orders_page_html() {
                         <th style="width:70px;padding:12px;">画像</th>
                         <th style="padding:12px;">商品名 / 型番</th>
                         <th style="width:100px;padding:12px;">受注状態</th>
-                        <th style="width:90px;padding:12px;">LINE送信</th>
+                        <th style="width:110px;padding:12px;">LINE送信</th>
                         <th style="padding:12px;width:160px;">受信日時</th>
                         <th style="width:220px;padding:12px;">操作</th>
                     </tr>
                 </thead>
                 <tbody>
                 <?php foreach ($orders as $o):
-                    $ost     = $order_statuses[$o->order_status] ?? array('label'=>$o->order_status,'color'=>'#888');
-                    $lst     = $line_statuses[$o->line_status]   ?? array('label'=>$o->line_status,'color'=>'#888');
-                    $thumb   = $o->img_url ? wp_get_attachment_image( (int)$o->img_id, array(60,60) ) : '';
+                    $ost   = $order_statuses[$o->order_status] ?? array('label'=>$o->order_status,'color'=>'#888');
+                    $lst   = $line_statuses[$o->line_status]   ?? array('label'=>$o->line_status,'color'=>'#888');
+                    $thumb = $o->img_url ? wp_get_attachment_image((int)$o->img_id, array(60,60)) : '';
                 ?>
                 <tr id="lo-row-<?php echo $o->id; ?>" style="border-bottom:1px solid #f0f0f0;">
                     <td style="padding:12px;color:#999;font-size:12px;"><?php echo $o->id; ?></td>
                     <td style="padding:8px 12px;">
                         <?php if ($thumb): ?>
-                        <div style="width:56px;height:56px;border-radius:6px;overflow:hidden;border:1px solid #e0e0e0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;">
-                            <?php echo $thumb; ?>
-                        </div>
+                        <div style="width:56px;height:56px;border-radius:6px;overflow:hidden;border:1px solid #e0e0e0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;"><?php echo $thumb; ?></div>
                         <?php else: ?>
-                        <div style="width:56px;height:56px;border-radius:6px;border:1px dashed #ccc;display:flex;align-items:center;justify-content:center;background:#fafafa;">
-                            <span class="dashicons dashicons-format-image" style="color:#ccc;font-size:22px;width:22px;height:22px;"></span>
-                        </div>
+                        <div style="width:56px;height:56px;border-radius:6px;border:1px dashed #ccc;display:flex;align-items:center;justify-content:center;background:#fafafa;"><span class="dashicons dashicons-format-image" style="color:#ccc;font-size:22px;width:22px;height:22px;"></span></div>
                         <?php endif; ?>
                     </td>
                     <td style="padding:12px;">
                         <div style="font-weight:700;font-size:14px;color:#222;"><?php echo esc_html($o->product_name); ?></div>
                         <div style="margin-top:4px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-                            <?php if ($o->group_label): ?>
-                            <span style="font-size:11px;color:#888;"><?php echo esc_html($o->group_label); ?></span>
-                            <span style="color:#ccc;">›</span>
-                            <?php endif; ?>
+                            <?php if ($o->group_label): ?><span style="font-size:11px;color:#888;"><?php echo esc_html($o->group_label); ?></span><span style="color:#ccc;">›</span><?php endif; ?>
                             <code style="background:#f0f6ff;border:1px solid #c8dff8;border-radius:4px;padding:2px 8px;font-size:13px;font-weight:700;color:#0073aa;"><?php echo esc_html($o->model_number); ?></code>
-                            <?php if ($o->model_label): ?>
-                            <span style="font-size:12px;color:#555;"><?php echo esc_html($o->model_label); ?></span>
-                            <?php endif; ?>
+                            <?php if ($o->model_label): ?><span style="font-size:12px;color:#555;"><?php echo esc_html($o->model_label); ?></span><?php endif; ?>
                         </div>
                     </td>
                     <td style="padding:12px;">
@@ -779,25 +974,12 @@ function lo_orders_page_html() {
                     <td style="padding:12px;font-size:12px;color:#555;"><?php echo esc_html($o->created_at); ?></td>
                     <td style="padding:12px;">
                         <div style="display:flex;flex-wrap:wrap;gap:4px;">
-                            <!-- 詳細ボタン -->
-                            <button type="button" class="button button-small lo-detail-btn" data-id="<?php echo $o->id; ?>"
-                                    style="font-size:11px;display:inline-flex;align-items:center;gap:3px;">
-                                <span class="dashicons dashicons-visibility" style="font-size:13px;width:13px;height:13px;"></span>詳細
-                            </button>
-                            <!-- LINE再送信 -->
-                            <button type="button" class="button button-small lo-resend-btn" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>"
-                                    style="font-size:11px;display:inline-flex;align-items:center;gap:3px;color:#00B900;border-color:#00B900;">
-                                <span class="dashicons dashicons-update" style="font-size:13px;width:13px;height:13px;"></span>再送信
-                            </button>
-                            <!-- 削除 -->
-                            <button type="button" class="button button-small lo-delete-btn" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>"
-                                    style="font-size:11px;display:inline-flex;align-items:center;gap:3px;color:#dc3545;border-color:#dc3545;">
-                                <span class="dashicons dashicons-trash" style="font-size:13px;width:13px;height:13px;"></span>削除
-                            </button>
+                            <button type="button" class="button button-small lo-detail-btn" data-id="<?php echo $o->id; ?>" style="font-size:11px;display:inline-flex;align-items:center;gap:3px;"><span class="dashicons dashicons-visibility" style="font-size:13px;width:13px;height:13px;"></span>詳細</button>
+                            <button type="button" class="button button-small lo-resend-btn" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>" style="font-size:11px;display:inline-flex;align-items:center;gap:3px;color:#00B900;border-color:#00B900;"><span class="dashicons dashicons-update" style="font-size:13px;width:13px;height:13px;"></span>再送信</button>
+                            <button type="button" class="button button-small lo-delete-btn" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>" style="font-size:11px;display:inline-flex;align-items:center;gap:3px;color:#dc3545;border-color:#dc3545;"><span class="dashicons dashicons-trash" style="font-size:13px;width:13px;height:13px;"></span>削除</button>
                         </div>
                     </td>
                 </tr>
-                <!-- 詳細行（初期非表示） -->
                 <tr id="lo-detail-<?php echo $o->id; ?>" style="display:none;background:#f9fafb;">
                     <td colspan="7" style="padding:16px 20px;">
                         <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap;">
@@ -805,8 +987,7 @@ function lo_orders_page_html() {
                             <div style="flex-shrink:0;">
                                 <div style="font-weight:700;color:#555;font-size:12px;margin-bottom:6px;">🖼 商品画像</div>
                                 <div style="width:120px;height:120px;border-radius:8px;overflow:hidden;border:1px solid #e0e0e0;display:flex;align-items:center;justify-content:center;background:#f5f5f5;">
-                                    <img src="<?php echo esc_url($o->img_url); ?>" alt="<?php echo esc_attr($o->product_name); ?>"
-                                         style="max-width:100%;max-height:100%;object-fit:contain;display:block;"/>
+                                    <img src="<?php echo esc_url($o->img_url); ?>" alt="" style="max-width:100%;max-height:100%;object-fit:contain;display:block;"/>
                                 </div>
                             </div>
                             <?php endif; ?>
@@ -823,82 +1004,51 @@ function lo_orders_page_html() {
         </div>
         <?php endif; ?>
     </div>
-
     <style>
     .lo-status-sel option[value="new"]        { color:#2271b1; }
     .lo-status-sel option[value="processing"] { color:#f0b429; }
     .lo-status-sel option[value="done"]       { color:#00B900; }
     .lo-status-sel option[value="cancelled"]  { color:#dc3545; }
     </style>
-
     <script>
     (function($){
         var ajaxUrl = '<?php echo admin_url('admin-ajax.php'); ?>';
-
-        /* ステータス変更 */
         $(document).on('change', '.lo-status-sel', function(){
-            var $sel   = $(this);
-            var oid    = $sel.data('id');
-            var nonce  = $sel.data('nonce');
-            var status = $sel.val();
-            var colors = { new:'#2271b1', processing:'#f0b429', done:'#00B900', cancelled:'#dc3545' };
-            $.post(ajaxUrl, { action:'lo_update_order_status', order_id:oid, status:status, nonce:nonce })
-                .done(function(res){
-                    if (res.success) {
-                        $sel.css({ borderColor: colors[status]||'#ccc', color: colors[status]||'#333' });
-                    }
-                });
+            var $s=$(this), oid=$s.data('id'), nonce=$s.data('nonce'), st=$s.val();
+            var colors={new:'#2271b1',processing:'#f0b429',done:'#00B900',cancelled:'#dc3545'};
+            $.post(ajaxUrl,{action:'lo_update_order_status',order_id:oid,status:st,nonce:nonce})
+             .done(function(r){ if(r.success) $s.css({borderColor:colors[st]||'#ccc',color:colors[st]||'#333'}); });
         });
-
-        /* 詳細トグル */
-        $(document).on('click', '.lo-detail-btn', function(){
-            var id  = $(this).data('id');
-            var $tr = $('#lo-detail-' + id);
-            $tr.toggle();
+        $(document).on('click','.lo-detail-btn',function(){
+            var id=$(this).data('id');
+            $('#lo-detail-'+id).toggle();
             $(this).find('.dashicons').toggleClass('dashicons-visibility dashicons-hidden');
         });
-
-        /* LINE再送信 */
-        $(document).on('click', '.lo-resend-btn', function(){
-            var $btn  = $(this);
-            var oid   = $btn.data('id');
-            var nonce = $btn.data('nonce');
-            $btn.prop('disabled', true).text('送信中...');
-            $.post(ajaxUrl, { action:'lo_resend_line', order_id:oid, nonce:nonce })
-                .done(function(res){
-                    var $badge = $('.lo-line-badge-' + oid);
-                    if (res.success) {
-                        $badge.text('送信済').css({ color:'#00B900', borderColor:'#00B90055', background:'#00B90022' });
-                        alert('LINE再送信しました。');
-                    } else {
-                        $badge.text('失敗').css({ color:'#dc3545', borderColor:'#dc354555', background:'#dc354522' });
-                        alert('失敗: ' + res.data);
-                    }
-                })
-                .always(function(){
-                    $btn.prop('disabled', false).html('<span class="dashicons dashicons-update" style="font-size:13px;width:13px;height:13px;"></span>再送信');
-                });
+        $(document).on('click','.lo-resend-btn',function(){
+            var $b=$(this),oid=$b.data('id'),nonce=$b.data('nonce');
+            $b.prop('disabled',true).text('送信中...');
+            $.post(ajaxUrl,{action:'lo_resend_line',order_id:oid,nonce:nonce})
+             .done(function(r){
+                 var $bg=$('.lo-line-badge-'+oid);
+                 if(r.success){$bg.text('API送信済').css({color:'#00B900',borderColor:'#00B90055',background:'#00B90022'});alert('LINE再送信しました。');}
+                 else{$bg.text('失敗').css({color:'#dc3545',borderColor:'#dc354555',background:'#dc354522'});alert('失敗: '+r.data);}
+             })
+             .always(function(){$b.prop('disabled',false).html('<span class="dashicons dashicons-update" style="font-size:13px;width:13px;height:13px;"></span>再送信');});
         });
-
-        /* 削除 */
-        $(document).on('click', '.lo-delete-btn', function(){
-            if (!confirm('この発注を削除しますか？')) return;
-            var $btn  = $(this);
-            var oid   = $btn.data('id');
-            var nonce = $btn.data('nonce');
-            $.post(ajaxUrl, { action:'lo_delete_order', order_id:oid, nonce:nonce })
-                .done(function(res){
-                    if (res.success) {
-                        $('#lo-row-' + oid).fadeOut(300, function(){ $(this).remove(); });
-                        $('#lo-detail-' + oid).remove();
-                    }
-                });
+        $(document).on('click','.lo-delete-btn',function(){
+            if(!confirm('この発注を削除しますか？'))return;
+            var $b=$(this),oid=$b.data('id'),nonce=$b.data('nonce');
+            $.post(ajaxUrl,{action:'lo_delete_order',order_id:oid,nonce:nonce})
+             .done(function(r){ if(r.success){$('#lo-row-'+oid+',#lo-detail-'+oid).fadeOut(300,function(){$(this).remove();}); }});
         });
     })(jQuery);
     </script>
     <?php
 }
 
+/* ============================================================
+   管理画面コピー JS（v1.0 そのまま）
+============================================================ */
 function lo_admin_copy_js() { ?>
 <script>
 (function($){
@@ -923,7 +1073,7 @@ function lo_admin_copy_js() { ?>
             navigator.clipboard.writeText(text).then(showDone).catch(function(){ alert('コピーできませんでした:\n' + text); });
         } else { alert('コピーできませんでした:\n' + text); }
     }
-    $(document).on('click', '.lo-sc-copy-btn',  function(e){ e.preventDefault(); loCopyText($(this).data('copy'), $(this)); });
+    $(document).on('click', '.lo-sc-copy-btn',   function(e){ e.preventDefault(); loCopyText($(this).data('copy'), $(this)); });
     $(document).on('click', '.lo-list-copy-btn', function(e){ e.preventDefault(); loCopyText($(this).data('copy'), $(this)); });
     $(document).on('click', '.lo-page-copy-btn', function(e){ e.preventDefault(); loCopyText($(this).data('copy'), $(this)); });
 })(jQuery);
@@ -933,6 +1083,9 @@ function lo_admin_copy_js() { ?>
 </style>
 <?php }
 
+/* ============================================================
+   管理画面インライン JS（v1.0 そのまま）
+============================================================ */
 function lo_admin_inline_js() { global $post_type; if ($post_type!=='lo_product') return; ?>
 <script>
 jQuery(function($){
@@ -996,16 +1149,40 @@ jQuery(function($){
 </script>
 <?php }
 
-add_action('wp_enqueue_scripts','lo_front_scripts');
+/* ============================================================
+   フロントエンド スクリプト登録
+   ★変更: LIFF SDK を head に追加 + liff_id を JS に渡す
+============================================================ */
+/* フック登録はすべてトップレベルで行う（wp_enqueue_scripts の内側では wp_footer が機能しない場合がある） */
+add_action('wp_enqueue_scripts', 'lo_front_scripts');
+add_action('wp_head',            'lo_front_css');
+add_action('wp_head',            'lo_liff_sdk_tag');
+add_action('wp_head',            'lo_front_vars');
+add_action('wp_head',            'lo_front_js');
+
 function lo_front_scripts() {
-    add_action('wp_head',  'lo_front_css');
-    add_action('wp_footer','lo_front_js');
-    wp_localize_script('jquery','loFront',array(
-        'ajax_url' => admin_url('admin-ajax.php'),
-        'nonce'    => wp_create_nonce('lo_front'),
-    ));
+    wp_enqueue_script('jquery');
 }
 
+/* loFront 変数を直接 <script> で出力（wp_localize_script 非依存） */
+function lo_front_vars() { ?>
+<script>
+var loFront = {
+    ajax_url: <?php echo wp_json_encode( admin_url('admin-ajax.php') ); ?>,
+    nonce:    <?php echo wp_json_encode( wp_create_nonce('lo_front') ); ?>,
+    liff_id:  <?php echo wp_json_encode( (string) get_option('lo_liff_id','') ); ?>
+};
+</script>
+<?php }
+
+function lo_liff_sdk_tag() {
+    if ( !get_option('lo_liff_id','') ) return;
+    echo '<script charset="utf-8" src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>' . "\n";
+}
+
+/* ============================================================
+   フロントエンド CSS（v1.0 そのまま）
+============================================================ */
 function lo_front_css() { ?>
 <style>
 .lo-wrap{max-width:1100px;margin:0 auto;padding:24px 16px 40px;font-family:'Hiragino Kaku Gothic ProN','Meiryo','Yu Gothic',sans-serif;color:#333;box-sizing:border-box}
@@ -1037,111 +1214,394 @@ function lo_front_css() { ?>
 .lo-sbtn:active{transform:translateY(0)}
 .lo-sbtn:disabled{opacity:.6;cursor:not-allowed;transform:none}
 .lo-rmsg{text-align:center;margin-top:16px;font-size:15px;font-weight:600;min-height:1.6em}
-.lo-rmsg.ok{color:#00B900}.lo-rmsg.ng{color:#dc3545}
+.lo-rmsg.ok{color:#00B900}.lo-rmsg.ng{color:#dc3545}.lo-rmsg.ng-persist{color:#dc3545}
 .lo-err{color:#dc3545;background:#fff3f3;border:1px solid #f5c6cb;border-radius:6px;padding:12px 16px;font-size:14px}
 @media(max-width:820px){.lo-grid{grid-template-columns:1fr;gap:0}.lo-col-l{position:static;margin-bottom:24px}.lo-sbtn{min-width:220px;padding:15px 40px;font-size:16px}}
 @media(max-width:480px){.lo-wrap{padding:16px 12px 32px}.lo-ci{padding:10px 12px}.lo-sbtn{width:90%;min-width:unset;padding:14px 24px;font-size:15px}}
 </style>
 <?php }
 
+/* ============================================================
+   フロントエンド JS
+   ★変更: loSubmit を LIFF sendMessages ベースに変更
+   　loSelectCard / loCopyModel / loMarkCopied は v1.0 そのまま
+============================================================ */
 function lo_front_js() { ?>
 <script>
-/* ラジオ選択 → 同グループリセット → 選択カードをハイライト＋コピーボタン表示 */
+/* ================================================================
+   ユーティリティ
+================================================================ */
+
+/* LINEアプリ内ブラウザかどうかを User-Agent で判定
+   ※ liff.init() を呼ぶ前に確認することでリダイレクトを防ぐ */
+function loIsLineApp() {
+    return navigator.userAgent.indexOf('Line/') !== -1;
+}
+
+/* メッセージ表示（.lo-rmsg に表示） */
+function loShowMsg($el, cls, msg) {
+    $el.removeClass('ok ng').addClass(cls).html(msg);
+    if (cls !== 'ng-persist') {
+        setTimeout(function(){ $el.html('').removeClass('ok ng ng-persist'); }, 9000);
+    }
+}
+
+/* ================================================================
+   PCブラウザ用：LIFF URL 案内モーダルを表示
+   ─ ボタン押下時に liff.line.me URL + QR コードをページ内に表示する
+================================================================ */
+/* ================================================================
+   PCブラウザ用：注文内容プレビュー + QR / LIFF URL 案内モーダル
+   orderData = { img_url, has_image, message, model_label, model_number }
+================================================================ */
+function loShowLiffGuide(orderData) {
+    var liffId  = (typeof loFront !== 'undefined') ? loFront.liff_id : '';
+    var liffUrl = 'https://liff.line.me/' + liffId;
+    orderData   = orderData || {};
+
+    jQuery('#lo-liff-modal').remove();
+
+    /* QRコードはライブラリで動的生成 */
+
+    /* 注文内容プレビュー HTML */
+    var previewHtml = '';
+    if (orderData.has_image && orderData.img_url) {
+        previewHtml +=
+            '<div style="margin-bottom:10px;">'
+            + '<img src="' + orderData.img_url + '" alt="" style="'
+            +     'max-width:100%;max-height:140px;object-fit:contain;'
+            +     'border-radius:8px;border:1px solid #eee;"/>'
+            + '</div>';
+    }
+    if (orderData.message) {
+        /* 発注テキストを行ごとに整形して表示 */
+        var lines = orderData.message.split(String.fromCharCode(10)).map(function(l){ return l.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); });
+        previewHtml +=
+            '<div style="'
+            +   'background:#f8f9fa;border:1px solid #e0e0e0;border-radius:8px;'
+            +   'padding:10px 12px;margin-bottom:14px;text-align:left;">'
+            + '<p style="font-size:11px;color:#888;margin:0 0 6px;font-weight:bold;">📋 発注内容</p>'
+            + '<div style="font-size:12px;color:#333;line-height:1.8;white-space:pre-wrap;">'
+            +   lines.join(String.fromCharCode(10))
+            + '</div>'
+            + '</div>';
+    }
+
+    var html =
+        '<div id="lo-liff-modal" style="'
+        +   'position:fixed;top:0;left:0;width:100%;height:100%;'
+        +   'background:rgba(0,0,0,.6);z-index:99999;'
+        +   'display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;">'
+        +   '<div style="'
+        +       'background:#fff;border-radius:16px;padding:24px 20px;max-width:420px;width:100%;'
+        +       'text-align:center;box-shadow:0 8px 40px rgba(0,0,0,.3);position:relative;'
+        +       'max-height:90vh;overflow-y:auto;">'
+        +     '<button id="lo-liff-modal-close" style="'
+        +         'position:absolute;top:12px;right:14px;background:none;border:none;'
+        +         'font-size:22px;cursor:pointer;color:#999;line-height:1;z-index:1;">✕</button>'
+
+        /* ヘッダー */
+        +     '<div style="font-size:13px;font-weight:bold;color:#00B900;margin-bottom:14px;'
+        +         'background:#f0fff0;border:1px solid #b2dfb2;border-radius:8px;padding:8px 12px;">'
+        +       '✅ 発注内容を確認してください'
+        +     '</div>'
+
+        /* 注文プレビュー */
+        +     previewHtml
+
+        /* QRコード案内 */
+        +     '<div style="border-top:1px solid #eee;padding-top:14px;">'
+        +       '<p style="font-size:13px;color:#333;margin:0 0 10px;font-weight:bold;">📱 LINEアプリで送信する</p>'
+        +       '<p style="font-size:12px;color:#666;margin:0 0 12px;line-height:1.6;">'
+        +         'スマートフォンのLINEでQRを読み取るか、<br>URLをコピーしてLINEで開いてください。'
+        +       '</p>'
+        +       '<div id="lo-qr-canvas" style="width:160px;height:160px;margin:0 auto 12px;border:1px solid #eee;border-radius:8px;overflow:hidden;display:flex;align-items:center;justify-content:center;background:#fff;"><span style="font-size:11px;color:#aaa;">生成中...</span></div>'
+        +       '<div style="background:#f5f5f5;border-radius:8px;padding:8px 10px;">'
+        +         '<div style="display:flex;align-items:center;gap:6px;">'
+        +           '<code style="font-size:11px;color:#333;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left;">'
+        +             liffUrl
+        +           '</code>'
+        +           '<button id="lo-liff-url-copy" style="'
+        +               'flex-shrink:0;background:#06C755;color:#fff;border:none;border-radius:6px;'
+        +               'padding:5px 12px;font-size:12px;cursor:pointer;white-space:nowrap;font-weight:bold;">コピー</button>'
+        +         '</div>'
+        +       '</div>'
+        +     '</div>'
+        +   '</div>'
+        + '</div>';
+
+    jQuery('body').append(html);
+
+    /* QRコード生成（qrcode.js ライブラリを動的ロードして生成） */
+    (function(){
+        var container = document.getElementById('lo-qr-canvas');
+        if (!container) return;
+        function generateQR() {
+            container.innerHTML = '';
+            new QRCode(container, {
+                text:         liffUrl,
+                width:        156,
+                height:       156,
+                colorDark:    '#000000',
+                colorLight:   '#ffffff',
+                correctLevel: QRCode.CorrectLevel.M
+            });
+        }
+        if (typeof QRCode !== 'undefined') {
+            generateQR();
+        } else {
+            var s = document.createElement('script');
+            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
+            s.onload = generateQR;
+            document.head.appendChild(s);
+        }
+    })();
+
+    jQuery('#lo-liff-modal-close, #lo-liff-modal').on('click', function(e){
+        if (e.target === this) jQuery('#lo-liff-modal').fadeOut(200, function(){ jQuery(this).remove(); });
+    });
+    jQuery('#lo-liff-modal > div').on('click', function(e){ e.stopPropagation(); });
+
+    jQuery('#lo-liff-url-copy').on('click', function(){
+        var $b = jQuery(this);
+        var ta = document.createElement('textarea');
+        ta.value = liffUrl;
+        ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0;';
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand('copy'); } catch(e) {}
+        document.body.removeChild(ta);
+        $b.text('✓ コピー済').css('background','#555');
+        setTimeout(function(){ $b.text('コピー').css('background','#06C755'); }, 2000);
+    });
+}
+
+/* ================================================================
+   LIFF 初期化（LINEアプリ内でのみ実行）
+================================================================ */
+var _loLiffReady   = false;
+var _loLiffFailed  = false;
+var _loLiffIniting = false;
+
+function loInitLiff(callback) {
+    var liffId = (typeof loFront !== 'undefined') ? loFront.liff_id : '';
+
+    /* ── LIFF ID 未設定 ── */
+    if (!liffId) {
+        callback(false, 'liff_id_missing');
+        return;
+    }
+
+    /* ── LINEアプリ外（PC・スマホブラウザ）── liff.init() を呼ばずに即返す */
+    if (!loIsLineApp()) {
+        callback(false, 'not_line_app');
+        return;
+    }
+
+    /* ── SDK 未ロード ── */
+    if (typeof liff === 'undefined') {
+        callback(false, 'sdk_missing');
+        return;
+    }
+
+    if (_loLiffReady)  { callback(true); return; }
+    if (_loLiffFailed) { callback(false, 'init_failed'); return; }
+    if (_loLiffIniting) {
+        var t = setInterval(function(){
+            if (_loLiffReady)  { clearInterval(t); callback(true); }
+            if (_loLiffFailed) { clearInterval(t); callback(false, 'init_failed'); }
+        }, 100);
+        return;
+    }
+
+    _loLiffIniting = true;
+    liff.init({ liffId: liffId })
+        .then(function()  { _loLiffReady = true;  _loLiffIniting = false; callback(true); })
+        .catch(function(e){ _loLiffFailed = true; _loLiffIniting = false;
+            console.error('liff.init error:', e);
+            callback(false, 'init_error:' + (e.message || e));
+        });
+}
+
+/* ================================================================
+   ラジオ選択 → カードハイライト ＋ コピーボタン表示（v1.0 そのまま）
+================================================================ */
 function loSelectCard(radio) {
     var wrap = radio.closest('.lo-wrap');
-    /* wrap内の全ラジオをリセット（グループをまたいで1択） */
-    var all = wrap.querySelectorAll('input.lo-radio');
+    var all  = wrap.querySelectorAll('input.lo-radio');
     for (var i = 0; i < all.length; i++) {
-        var ci = all[i].closest('.lo-ci');
+        var ci  = all[i].closest('.lo-ci');
         ci.style.borderColor = '';
         ci.style.boxShadow   = '';
         ci.style.background  = '';
         var btn = ci.querySelector('.lo-cpbtn');
-        if (btn) {
-            btn.style.display = 'none';
-            btn.textContent   = '⧉ コピー';
-            btn.style.background = '';
-            btn.style.color      = '';
-        }
+        if (btn) { btn.style.display = 'none'; btn.textContent = '⧉ コピー'; btn.style.background = ''; btn.style.color = ''; }
     }
-    /* 選択カードをハイライト */
     var selCi = radio.closest('.lo-ci');
     selCi.style.borderColor = '#00B900';
     selCi.style.boxShadow   = '3px 3px 0 0 #66cc66';
     selCi.style.background  = '#f0fff0';
-    /* コピーボタンを表示 */
     var selBtn = selCi.querySelector('.lo-cpbtn');
-    if (selBtn) {
-        selBtn.style.display = 'inline-block';
-    }
+    if (selBtn) selBtn.style.display = 'inline-block';
 }
 
-/* コピーボタン → 型番をクリップボードへ */
+/* ================================================================
+   コピーボタン → 型番をクリップボードへ（v1.0 そのまま）
+================================================================ */
 function loCopyModel(btn) {
     var mnum = btn.closest('.lo-ci-bottom').querySelector('.lo-mnum');
     if (!mnum) return;
     var text = mnum.textContent.trim();
-
-    /* textarea を使ったコピー（HTTP/HTTPS両対応）*/
     var ta = document.createElement('textarea');
     ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.top      = '0';
-    ta.style.left     = '0';
-    ta.style.width    = '1px';
-    ta.style.height   = '1px';
-    ta.style.padding  = '0';
-    ta.style.border   = 'none';
-    ta.style.fontSize = '16px';
-    ta.style.opacity  = '0';
+    ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:none;font-size:16px;opacity:0;';
     document.body.appendChild(ta);
-    ta.focus();
-    ta.select();
-    ta.setSelectionRange(0, ta.value.length);
-
+    ta.focus(); ta.select(); ta.setSelectionRange(0, ta.value.length);
     var ok = false;
     try { ok = document.execCommand('copy'); } catch(e) {}
     document.body.removeChild(ta);
-
-    if (!ok && navigator.clipboard) {
-        navigator.clipboard.writeText(text).then(function(){ loMarkCopied(btn); });
-        return;
-    }
+    if (!ok && navigator.clipboard) { navigator.clipboard.writeText(text).then(function(){ loMarkCopied(btn); }); return; }
     if (ok) loMarkCopied(btn);
 }
-
 function loMarkCopied(btn) {
-    btn.textContent      = '✓ コピー済み';
-    btn.style.background = '#00B900';
-    btn.style.color      = '#fff';
+    btn.textContent = '✓ コピー済み'; btn.style.background = '#00B900'; btn.style.color = '#fff';
 }
 
-/* 送信ボタン */
+/* ================================================================
+   送信ボタン — メインフロー
+   LINEアプリ外  → QR / LIFF URL 案内モーダルを表示
+   LINEアプリ内  → AJAX → liff.sendMessages() → DB更新
+================================================================ */
 function loSubmit(pid) {
-    var $b = jQuery('[data-pid="'+pid+'"].lo-sbtn');
-    var $w = jQuery('#lo-w-'+pid);
-    var $r = jQuery('#lo-r-'+pid);
+    var $b      = jQuery('[data-pid="'+pid+'"].lo-sbtn');
+    var $w      = jQuery('#lo-w-'+pid);
+    var $r      = jQuery('#lo-r-'+pid);
     var checked = $w.find('input.lo-radio:checked')[0];
     if (!checked) { loShowMsg($r, 'ng', '型番を選択してください。'); return; }
-    var ot = jQuery.trim($b.text());
-    $b.prop('disabled', true).text('送信中...');
-    $r.removeClass('ok ng').text('');
-    var d = { action:'lo_submit', nonce:loFront.nonce, post_id:pid, lo_selected_model:checked.value };
-    jQuery.post(loFront.ajax_url, d)
-        .done(function(res){
-            if (res.success) loShowMsg($r, 'ok', res.data||'送信しました。');
-            else             loShowMsg($r, 'ng', res.data||'送信に失敗しました。');
+
+    var origText = jQuery.trim($b.text());
+    $b.prop('disabled', true).text('処理中...');
+    $r.removeClass('ok ng ng-persist').html('');
+
+    loInitLiff(function(liffOk, errCode) {
+
+        /* ── LINEアプリ外 → AJAX で発注データ取得 → 注文内容プレビュー付きモーダル表示 ── */
+        if (errCode === 'not_line_app') {
+            jQuery.post(loFront.ajax_url, {
+                action:            'lo_submit',
+                nonce:             loFront.nonce,
+                post_id:           pid,
+                lo_selected_model: checked.value
+            })
+            .done(function(res) {
+                $b.prop('disabled', false).text(origText);
+                if (res.success) {
+                    loShowLiffGuide(res.data);
+                } else {
+                    loShowMsg($r, 'ng', res.data || '発注データの取得に失敗しました。');
+                }
+            })
+            .fail(function() {
+                $b.prop('disabled', false).text(origText);
+                loShowMsg($r, 'ng', '通信エラーが発生しました。');
+            });
+            return;
+        }
+
+        /* ── LIFF ID未設定 ── */
+        if (errCode === 'liff_id_missing') {
+            loShowMsg($r, 'ng',
+                '<span style="display:block;padding:12px 14px;background:#fff3cd;border:1px solid #ffc107;border-radius:8px;font-size:13px;line-height:1.7;color:#856404;">'
+                + '⚠️ <strong>LIFF IDが設定されていません。</strong><br>'
+                + 'WordPress管理画面 → LINE発注 → LINE設定 で LIFF ID を登録してください。'
+                + '</span>');
+            $b.prop('disabled', false).text(origText);
+            return;
+        }
+
+        /* ── SDK未ロード ── */
+        if (errCode === 'sdk_missing') {
+            loShowMsg($r, 'ng', 'LIFF SDKの読み込みに失敗しました。ページを再読み込みしてください。');
+            $b.prop('disabled', false).text(origText);
+            return;
+        }
+
+        /* ── init エラー ── */
+        if (!liffOk) {
+            loShowMsg($r, 'ng', 'LIFF初期化エラーが発生しました。ページを再読み込みして再度お試しください。');
+            $b.prop('disabled', false).text(origText);
+            return;
+        }
+
+        /* ── LINEアプリ内：AJAX → LINE送信 ── */
+        jQuery.post(loFront.ajax_url, {
+            action:            'lo_submit',
+            nonce:             loFront.nonce,
+            post_id:           pid,
+            lo_selected_model: checked.value
         })
-        .fail(function(){ loShowMsg($r, 'ng', '通信エラーが発生しました。'); })
-        .always(function(){ $b.prop('disabled', false).text(ot); });
+        .done(function(res) {
+            if (!res.success) {
+                loShowMsg($r, 'ng', res.data || '送信に失敗しました。');
+                $b.prop('disabled', false).text(origText);
+                return;
+            }
+            var d           = res.data;
+            var orderId     = d.order_id;
+            var lineMessages = [];
+            if (d.has_image && d.img_url) {
+                lineMessages.push({ type:'image', originalContentUrl:d.img_url, previewImageUrl:d.img_url });
+            }
+            lineMessages.push({ type:'text', text:d.message });
+
+            loSendViaLiff(lineMessages, function(sent) {
+                jQuery.post(loFront.ajax_url, {
+                    action:'lo_liff_sent', nonce:loFront.nonce,
+                    order_id:orderId, result:sent?'sent':'failed'
+                });
+                if (sent) {
+                    loShowMsg($r, 'ok', 'ご注文を受け付けました。LINEへ送信しました。');
+                } else {
+                    loShowMsg($r, 'ng', '発注を保存しましたが、LINE送信に失敗しました。管理画面から再送信できます。');
+                }
+                $b.prop('disabled', false).text(origText);
+            });
+        })
+        .fail(function() {
+            loShowMsg($r, 'ng', '通信エラーが発生しました。');
+            $b.prop('disabled', false).text(origText);
+        });
+    });
 }
-function loShowMsg($el, cls, msg){
-    $el.removeClass('ok ng').addClass(cls).text(msg);
-    setTimeout(function(){ $el.text('').removeClass('ok ng'); }, 6000);
+
+/* ================================================================
+   LIFF 送信ロジック（LINEアプリ内専用）
+   ・トークから開いた   → sendMessages（そのトークに送信）
+   ・LINEメニュー等から → shareTargetPicker（送信先を選択）
+================================================================ */
+function loSendViaLiff(messages, callback) {
+    if (liff.isInClient()) {
+        liff.sendMessages(messages)
+            .then(function()  { callback(true);  })
+            .catch(function(e){ console.error('sendMessages error:', e); callback(false); });
+        return;
+    }
+    if (liff.isApiAvailable('shareTargetPicker')) {
+        liff.shareTargetPicker(messages, { isMultiple:false })
+            .then(function(res){ callback(!!(res && res.status === 'success')); })
+            .catch(function(e){ console.error('shareTargetPicker error:', e); callback(false); });
+        return;
+    }
+    /* フォールバック：上記どちらも使えない場合 */
+    loShowLiffGuide();
+    callback(false);
 }
 </script>
 <?php }
 
+/* ============================================================
+   ショートコード [line_order id="X"]（v1.0 そのまま）
+============================================================ */
 add_shortcode('line_order','lo_shortcode');
 function lo_shortcode($atts) {
     $atts = shortcode_atts(array('id'=>0),$atts,'line_order');
