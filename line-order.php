@@ -16,6 +16,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
+
 if ( ! defined('LO_VERSION') )    define( 'LO_VERSION', '2.1.0' );
 if ( ! defined('LO_URL') )        define( 'LO_URL', plugin_dir_url( __FILE__ ) );
 
@@ -458,12 +459,13 @@ Content-Type: application/json
 </div>
 <?php }
 
+
 /* ============================================================
    Messaging API 送信（管理画面からの再送信のみで使用）
 ============================================================ */
-function lo_send_line( $message, $img_url = '' ) {
+function lo_send_line( $message, $img_url = '', $to_override = '' ) {
     $token = get_option('lo_line_token','');
-    $to    = get_option('lo_line_to','');
+    $to    = ! empty($to_override) ? $to_override : get_option('lo_line_to','');
     if ( empty($token) ) return array('success'=>false,'message'=>'LINEトークンが未設定です。');
     if ( empty($to) )    return array('success'=>false,'message'=>'送信先が未設定です。');
 
@@ -557,12 +559,35 @@ function lo_ajax_submit() {
 
     $img_https = $img_url ? preg_replace('/^http:/', 'https:', $img_url) : '';
 
-    /* フロントの LIFF sendMessages 用にデータを返す */
+    /* LINEアプリ内からのリクエスト → Messaging API で即送信 */
+    $send_via_api = ! empty( $_POST['line_app'] );
+    $line_sent    = false;
+    if ( $send_via_api ) {
+        $line_uid = sanitize_text_field( $_POST['line_uid'] ?? '' );
+        /* POST にない場合は cookie からフォールバック */
+        if ( empty($line_uid) && ! empty($_COOKIE['lo_line_uid']) ) {
+            $line_uid = sanitize_text_field( $_COOKIE['lo_line_uid'] );
+        }
+        $result = lo_send_line( $message, $img_https, $line_uid );
+        if ( $result['success'] ) {
+            $line_sent = true;
+            $wpdb->update(
+                $wpdb->prefix . 'lo_orders',
+                array( 'line_status' => 'sent' ),
+                array( 'id' => $order_id ),
+                array( '%s' ),
+                array( '%d' )
+            );
+        }
+    }
+
     wp_send_json_success( array(
-        'order_id'  => $order_id,
-        'message'   => $message,
-        'img_url'   => $img_https,
-        'has_image' => !empty($img_https),
+        'order_id'   => $order_id,
+        'message'    => $message,
+        'img_url'    => $img_https,
+        'has_image'  => !empty($img_https),
+        'line_sent'  => $line_sent,
+        'line_error' => ( $send_via_api && ! $line_sent ) ? ( $result['message'] ?? '' ) : '',
     ) );
 }
 
@@ -595,23 +620,35 @@ function lo_ajax_get_order() {
 add_action('wp_ajax_lo_liff_sent',        'lo_ajax_liff_sent');
 add_action('wp_ajax_nopriv_lo_liff_sent', 'lo_ajax_liff_sent');
 function lo_ajax_liff_sent() {
-    check_ajax_referer('lo_front','nonce');
+    /*
+     * $die=false: キャッシュプラグインで nonce が古くなっても wp_die() しない。
+     * sendBeacon はレスポンスを見ないため、403 で死ぬと DB が更新されずに
+     * 「未送信」のままになる。verify に失敗しても処理を継続し、
+     * 下記の order 存在チェックで安全性を担保する。
+     */
+    check_ajax_referer( 'lo_front', 'nonce', false );
+
     global $wpdb;
     $oid    = absint( $_POST['order_id'] ?? 0 );
     $result = sanitize_text_field( $_POST['result'] ?? '' );
+    if ( ! $oid ) { wp_send_json_error( 'invalid_id' ); return; }
+
+    $table = $wpdb->prefix . 'lo_orders';
+
+    /* 発注 ID が実際に存在するかを確認（セキュリティ担保） */
+    $exists = $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE id=%d LIMIT 1", $oid ) );
+    if ( ! $exists ) { wp_send_json_error( 'not_found' ); return; }
+
     $status = ( $result === 'sent' ) ? 'sent_liff' : 'failed';
-    if ($oid) {
-        $table = $wpdb->prefix . 'lo_orders';
-        /* line_status を先に確実に更新（sent_at と分離してクエリ失敗を防ぐ） */
-        $wpdb->update( $table, array('line_status' => $status), array('id' => $oid) );
-        /* sent_at カラムが存在する場合のみ更新 */
-        if ( $status === 'sent_liff' ) {
-            $col = $wpdb->get_results("SHOW COLUMNS FROM `{$table}` LIKE 'sent_at'");
-            if ( !empty($col) ) {
-                $wpdb->update( $table, array('sent_at' => current_time('mysql')), array('id' => $oid) );
-            }
-        }
+
+    /* line_status を更新 */
+    $wpdb->update( $table, array( 'line_status' => $status ), array( 'id' => $oid ) );
+
+    /* sent_at を更新 */
+    if ( $status === 'sent_liff' ) {
+        $wpdb->update( $table, array( 'sent_at' => current_time( 'mysql' ) ), array( 'id' => $oid ) );
     }
+
     wp_send_json_success();
 }
 
@@ -1117,8 +1154,9 @@ function lo_orders_page_html() {
         $count  = (int) $wpdb->get_var( $wpdb->prepare("SELECT COUNT(*) FROM {$table} {$where}", ...$params) );
         $orders = $wpdb->get_results( $wpdb->prepare("SELECT * FROM {$table} {$where} ORDER BY created_at DESC LIMIT %d OFFSET %d", ...array_merge($params, array($per_page, $offset))) );
     } else {
-        $count  = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$table}");
-        $orders = $wpdb->get_results( $wpdb->prepare("SELECT * FROM {$table} ORDER BY created_at DESC LIMIT %d OFFSET %d", $per_page, $offset) );
+        /* $where（is_trashedフィルター）を必ず適用する */
+        $count  = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$table} {$where}" );
+        $orders = $wpdb->get_results( $wpdb->prepare("SELECT * FROM {$table} {$where} ORDER BY created_at DESC LIMIT %d OFFSET %d", $per_page, $offset) );
     }
     $total_pages = max(1, ceil($count / $per_page));
     $products    = get_posts(array('post_type'=>'lo_product','post_status'=>array('publish','draft'),'posts_per_page'=>-1,'orderby'=>'title','order'=>'ASC'));
@@ -1281,7 +1319,7 @@ function lo_orders_page_html() {
                         <div style="display:flex;flex-wrap:wrap;gap:4px;">
                         <?php if (!$view_trash): ?>
                             <button type="button" class="button button-small lo-detail-btn" data-id="<?php echo $o->id; ?>" style="font-size:11px;display:inline-flex;align-items:center;gap:3px;"><span class="dashicons dashicons-visibility" style="font-size:13px;width:13px;height:13px;"></span>詳細</button>
-                            <button type="button" class="button button-small lo-resend-btn" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>" style="font-size:11px;display:inline-flex;align-items:center;gap:3px;color:#00B900;border-color:#00B900;"><span class="dashicons dashicons-update" style="font-size:13px;width:13px;height:13px;"></span>再送信</button>
+                            <button type="button" class="button button-small lo-resend-qr-btn" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>" style="font-size:11px;display:inline-flex;align-items:center;gap:3px;color:#06C755;border-color:#06C755;"><span class="dashicons dashicons-camera" style="font-size:13px;width:13px;height:13px;"></span>QR再送信</button>
                             <button type="button" class="button button-small lo-trash-single-btn" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>" style="font-size:11px;display:inline-flex;align-items:center;gap:3px;color:#dc3545;border-color:#dc3545;"><span class="dashicons dashicons-trash" style="font-size:13px;width:13px;height:13px;"></span>ゴミ箱へ</button>
                         <?php else: ?>
                             <button type="button" class="button button-small lo-restore-single-btn" data-id="<?php echo $o->id; ?>" data-nonce="<?php echo $admin_nonce; ?>" style="font-size:11px;display:inline-flex;align-items:center;gap:3px;color:#2271b1;border-color:#2271b1;"><span class="dashicons dashicons-undo" style="font-size:13px;width:13px;height:13px;"></span>元に戻す</button>
@@ -1347,18 +1385,94 @@ function lo_orders_page_html() {
                 $(this).find('.dashicons').toggleClass('dashicons-visibility dashicons-hidden');
             });
 
-            /* 再送信ボタン */
-            $(document).on('click','.lo-resend-btn',function(){
-                var $b=$(this),oid=$b.data('id'),nonce=$b.data('nonce');
-                $b.prop('disabled',true).text('送信中...');
-                $.post(ajaxUrl,{action:'lo_resend_line',order_id:oid,nonce:nonce})
-                 .done(function(r){
-                     var $bg=$('.lo-line-badge-'+oid);
-                     if(r.success){$bg.text('API送信済').css({color:'#00B900',borderColor:'#00B90055',background:'#00B90022'});alert('LINE再送信しました。');}
-                     else{$bg.text('失敗').css({color:'#dc3545',borderColor:'#dc354555',background:'#dc354522'});alert('失敗: '+r.data);}
-                 })
-                 .always(function(){$b.prop('disabled',false).html('<span class="dashicons dashicons-update" style="font-size:13px;width:13px;height:13px;"></span>再送信');});
+            /* QR再送信ボタン → QRコードモーダルを表示 */
+            $(document).on('click','.lo-resend-qr-btn',function(e){
+                e.preventDefault();
+                e.stopPropagation();
+                var oid = $(this).data('id');
+                var liffId = '<?php echo esc_js( get_option('lo_liff_id','') ); ?>';
+                console.log('[LINE発注] QR再送信クリック orderId=' + oid + ' liffId=' + liffId);
+                if (!liffId) {
+                    /* モーダルで明確に通知 */
+                    $('<div id="lo-liffid-warn" style="position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:99999;display:flex;align-items:center;justify-content:center;">'
+                      + '<div style="background:#fff;border-radius:12px;padding:28px 24px;max-width:380px;width:90%;text-align:center;box-shadow:0 8px 40px rgba(0,0,0,.3);">'
+                      + '<div style="font-size:36px;margin-bottom:12px;">⚠️</div>'
+                      + '<p style="font-size:15px;font-weight:bold;color:#dc3545;margin:0 0 10px;">LIFF IDが設定されていません</p>'
+                      + '<p style="font-size:13px;color:#555;margin:0 0 18px;">LINE発注 → LINE設定 から LIFF App ID を登録してください。</p>'
+                      + '<a href="<?php echo esc_js( admin_url('edit.php?post_type=lo_product&page=lo-settings') ); ?>" class="button button-primary">LINE設定を開く</a>'
+                      + ' <button type="button" class="button" onclick="jQuery(\'#lo-liffid-warn\').remove()">閉じる</button>'
+                      + '</div></div>').appendTo('body');
+                    return;
+                }
+                var liffUrl = 'https://liff.line.me/' + liffId + '?order_id=' + oid;
+                loShowAdminResendQR(liffUrl, oid);
             });
+
+            /* QR再送信モーダル表示 */
+            function loShowAdminResendQR(liffUrl, orderId) {
+                $('#lo-resend-qr-modal').remove();
+                var html =
+                    '<div id="lo-resend-qr-modal" style="'
+                    +   'position:fixed;top:0;left:0;width:100%;height:100%;'
+                    +   'background:rgba(0,0,0,.6);z-index:99999;'
+                    +   'display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;">'
+                    +   '<div style="background:#fff;border-radius:12px;padding:28px 24px;max-width:360px;width:100%;'
+                    +       'text-align:center;box-shadow:0 8px 40px rgba(0,0,0,.3);position:relative;">'
+                    +     '<button id="lo-resend-qr-close" style="position:absolute;top:10px;right:14px;background:none;'
+                    +         'border:none;font-size:22px;cursor:pointer;color:#999;">✕</button>'
+                    +     '<p style="font-size:16px;font-weight:bold;color:#222;margin:0 0 6px;">QRコードで再送信</p>'
+                    +     '<p style="font-size:12px;color:#888;margin:0 0 16px;">スマホのLINEでこのQRを読み取ると発注が再送信されます</p>'
+                    +     '<div id="lo-resend-qr-canvas" style="width:200px;height:200px;margin:0 auto 16px;'
+                    +         'border:1px solid #eee;border-radius:8px;display:flex;align-items:center;'
+                    +         'justify-content:center;background:#fff;">'
+                    +         '<span style="font-size:11px;color:#aaa;">生成中...</span>'
+                    +     '</div>'
+                    +     '<p style="font-size:11px;color:#888;margin:0 0 10px;">発注ID: ' + orderId + '</p>'
+                    +     '<div style="background:#f5f5f5;border-radius:6px;padding:8px 10px;">'
+                    +       '<div style="display:flex;align-items:center;gap:6px;">'
+                    +         '<code style="font-size:10px;color:#555;flex:1;overflow:hidden;text-overflow:ellipsis;'
+                    +             'white-space:nowrap;text-align:left;">' + liffUrl + '</code>'
+                    +         '<button id="lo-resend-url-copy" style="flex-shrink:0;background:#06C755;color:#fff;'
+                    +             'border:none;border-radius:6px;padding:4px 8px;font-size:11px;cursor:pointer;">コピー</button>'
+                    +       '</div>'
+                    +     '</div>'
+                    +   '</div>'
+                    + '</div>';
+                $('body').append(html);
+                /* QR生成 */
+                (function(){
+                    var c = document.getElementById('lo-resend-qr-canvas');
+                    if (!c) return;
+                    function genQR(){
+                        c.innerHTML = '';
+                        new QRCode(c, { text:liffUrl, width:176, height:176,
+                            colorDark:'#000000', colorLight:'#ffffff',
+                            correctLevel: QRCode.CorrectLevel.M });
+                    }
+                    if (typeof QRCode !== 'undefined') { genQR(); }
+                    else {
+                        var s = document.createElement('script');
+                        s.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
+                        s.onload = genQR;
+                        document.head.appendChild(s);
+                    }
+                })();
+                /* URLコピー */
+                $('#lo-resend-url-copy').on('click', function(){
+                    var $b=$(this), ta=document.createElement('textarea');
+                    ta.value=liffUrl; ta.style.cssText='position:fixed;opacity:0;';
+                    document.body.appendChild(ta); ta.select();
+                    try{ document.execCommand('copy'); }catch(e){}
+                    document.body.removeChild(ta);
+                    $b.text('✓ コピー済').css('background','#555');
+                    setTimeout(function(){ $b.text('コピー').css('background','#06C755'); },2000);
+                });
+                /* 閉じる */
+                $('#lo-resend-qr-close, #lo-resend-qr-modal').on('click', function(e){
+                    if(e.target===this) $('#lo-resend-qr-modal').fadeOut(200,function(){$(this).remove();});
+                });
+                $('#lo-resend-qr-modal > div').on('click',function(e){e.stopPropagation();});
+            }
 
             /* 単体ゴミ箱へ移動（通常画面の「ゴミ箱へ」ボタン） */
             $(document).on('click','.lo-trash-single-btn',function(){
@@ -1633,7 +1747,7 @@ add_action('wp_enqueue_scripts', 'lo_front_scripts');
 add_action('wp_head',            'lo_front_css');
 add_action('wp_head',            'lo_liff_sdk_tag');
 add_action('wp_head',            'lo_front_vars');
-add_action('wp_head',            'lo_front_js');
+add_action('wp_footer',          'lo_front_js', 99);
 
 function lo_front_scripts() {
     wp_enqueue_script('jquery');
@@ -1711,7 +1825,8 @@ function lo_front_js() { ?>
 /* LINEアプリ内ブラウザかどうかを User-Agent で判定
    ※ liff.init() を呼ぶ前に確認することでリダイレクトを防ぐ */
 function loIsLineApp() {
-    return navigator.userAgent.indexOf('Line/') !== -1;
+    /* 大文字小文字を区別しない（デバイスにより "line/" と出る場合もある） */
+    return navigator.userAgent.toLowerCase().indexOf('line/') !== -1;
 }
 
 /* メッセージ表示（.lo-rmsg に表示） */
@@ -1736,73 +1851,41 @@ function loShowLiffGuide(orderData) {
 
     jQuery('#lo-liff-modal').remove();
 
-    /* 注文内容プレビュー HTML */
-    var previewHtml = '';
-    if (orderData.has_image && orderData.img_url) {
-        previewHtml +=
-            '<div style="margin-bottom:10px;">'
-            + '<img src="' + orderData.img_url + '" alt="" style="'
-            +     'max-width:100%;max-height:140px;object-fit:contain;'
-            +     'border-radius:8px;border:1px solid #eee;"/>'
-            + '</div>';
-    }
-    if (orderData.message) {
-        var lines = orderData.message.split(String.fromCharCode(10)).map(function(l){
-            return l.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        });
-        previewHtml +=
-            '<div style="background:#f8f9fa;border:1px solid #e0e0e0;border-radius:8px;'
-            +   'padding:10px 12px;margin-bottom:14px;text-align:left;">'
-            + '<p style="font-size:11px;color:#888;margin:0 0 6px;font-weight:bold;">📋 発注内容</p>'
-            + '<div style="font-size:12px;color:#333;line-height:1.8;white-space:pre-wrap;">'
-            +   lines.join(String.fromCharCode(10))
-            + '</div>'
-            + '</div>';
-    }
-
     var html =
         '<div id="lo-liff-modal" style="'
         +   'position:fixed;top:0;left:0;width:100%;height:100%;'
         +   'background:rgba(0,0,0,.6);z-index:99999;'
         +   'display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;">'
         +   '<div style="'
-        +       'background:#fff;border-radius:16px;padding:24px 20px;max-width:420px;width:100%;'
-        +       'text-align:center;box-shadow:0 8px 40px rgba(0,0,0,.3);position:relative;'
-        +       'max-height:90vh;overflow-y:auto;">'
+        +       'background:#fff;border-radius:16px;padding:28px 24px;max-width:340px;width:100%;'
+        +       'text-align:center;box-shadow:0 8px 40px rgba(0,0,0,.3);position:relative;">'
         +     '<button id="lo-liff-modal-close" style="'
         +         'position:absolute;top:12px;right:14px;background:none;border:none;'
         +         'font-size:22px;cursor:pointer;color:#999;line-height:1;z-index:1;">✕</button>'
 
-        +     '<div style="font-size:13px;font-weight:bold;color:#00B900;margin-bottom:14px;'
-        +         'background:#f0fff0;border:1px solid #b2dfb2;border-radius:8px;padding:8px 12px;">'
-        +       '✅ 発注内容を確認してください'
+        +     '<p style="font-size:17px;font-weight:bold;color:#222;margin:0 0 18px;">'
+        +       'QRコードをLINEで読み取る'
+        +     '</p>'
+
+        +     '<div id="lo-qr-canvas" style="width:200px;height:200px;margin:0 auto 18px;'
+        +         'border:1px solid #eee;border-radius:8px;overflow:hidden;background:#fff;'
+        +         'display:flex;align-items:center;justify-content:center;">'
+        +         '<span style="font-size:11px;color:#aaa;">生成中...</span>'
         +     '</div>'
 
-        +     previewHtml
+        +     '<p style="font-size:14px;color:#444;margin:0 0 18px;line-height:1.7;">'
+        +       'LINEからQRコードを読み取り<br>注文を行う'
+        +     '</p>'
 
-        +     '<div style="border-top:1px solid #eee;padding-top:14px;">'
-        +       '<p style="font-size:13px;color:#333;margin:0 0 6px;font-weight:bold;">📱 QRコードをLINEで読み取ると自動送信されます</p>'
-        +       '<p style="font-size:11px;color:#888;margin:0 0 12px;line-height:1.6;">'
-        +           'スマートフォンのLINEアプリでQRを読み取るだけで<br>発注内容が自動的に送信されます。'
-        +       '</p>'
-        +       '<div id="lo-qr-canvas" style="width:180px;height:180px;margin:0 auto 14px;'
-        +           'border:1px solid #eee;border-radius:8px;overflow:hidden;background:#fff;'
-        +           'display:flex;align-items:center;justify-content:center;">'
-        +           '<span style="font-size:11px;color:#aaa;">生成中...</span>'
+        +     '<div style="background:#f5f5f5;border-radius:8px;padding:8px 10px;">'
+        +       '<p style="font-size:10px;color:#999;margin:0 0 4px;text-align:left;">LIFF URL（LINEのトークに貼り付けて開く）</p>'
+        +       '<div style="display:flex;align-items:center;gap:6px;">'
+        +         '<code id="lo-liff-url-disp" style="font-size:10px;color:#555;flex:1;overflow:hidden;'
+        +             'text-overflow:ellipsis;white-space:nowrap;text-align:left;">' + liffUrl + '</code>'
+        +         '<button id="lo-liff-url-copy" style="'
+        +             'flex-shrink:0;background:#06C755;color:#fff;border:none;border-radius:6px;'
+        +             'padding:5px 10px;font-size:11px;cursor:pointer;white-space:nowrap;font-weight:bold;">コピー</button>'
         +       '</div>'
-        +       '<div style="background:#f5f5f5;border-radius:8px;padding:8px 10px;margin-bottom:10px;">'
-        +         '<p style="font-size:10px;color:#999;margin:0 0 4px;text-align:left;">LIFF URL（LINEのトークに貼り付けて開く）</p>'
-        +         '<div style="display:flex;align-items:center;gap:6px;">'
-        +           '<code id="lo-liff-url-disp" style="font-size:10px;color:#555;flex:1;overflow:hidden;'
-        +               'text-overflow:ellipsis;white-space:nowrap;text-align:left;">' + liffUrl + '</code>'
-        +           '<button id="lo-liff-url-copy" style="'
-        +               'flex-shrink:0;background:#06C755;color:#fff;border:none;border-radius:6px;'
-        +               'padding:5px 10px;font-size:11px;cursor:pointer;white-space:nowrap;font-weight:bold;">コピー</button>'
-        +         '</div>'
-        +       '</div>'
-        +       '<p style="font-size:11px;color:#aaa;margin:0;line-height:1.6;">'
-        +           'URLをLINEのトークに貼り付けてタップしても送信できます'
-        +       '</p>'
         +     '</div>'
         +   '</div>'
         + '</div>';
@@ -1962,94 +2045,97 @@ function loSubmit(pid) {
     $b.prop('disabled', true).text('処理中...');
     $r.removeClass('ok ng ng-persist').html('');
 
-    loInitLiff(function(liffOk, errCode) {
+    /* ── LINEアプリ内：AJAX で保存 + Messaging API 送信 → LINEブラウザを閉じる ── */
+    if (loIsLineApp()) {
 
-        /* ── LINEアプリ外 → AJAX で発注データ取得 → 注文内容プレビュー付きモーダル表示 ── */
-        if (errCode === 'not_line_app') {
+        /* ユーザーID取得 → 送信を実行する内部関数 */
+        function loDoLineSubmit(uid) {
             jQuery.post(loFront.ajax_url, {
                 action:            'lo_submit',
                 nonce:             loFront.nonce,
                 post_id:           pid,
-                lo_selected_model: checked.value
+                lo_selected_model: checked.value,
+                line_app:          '1',
+                line_uid:          uid
             })
             .done(function(res) {
-                $b.prop('disabled', false).text(origText);
-                if (res.success) {
-                    loShowLiffGuide(res.data);
+                if (!res.success) {
+                    loShowMsg($r, 'ng', res.data || '送信に失敗しました。');
+                    $b.prop('disabled', false).text(origText);
+                    return;
+                }
+                if (res.data.line_sent) {
+                    loShowMsg($r, 'ok', 'ご注文を受け付けました。LINEへ送信しました。');
+                    setTimeout(function(){
+                        try { liff.closeWindow(); } catch(e) {}
+                        window.close();
+                    }, 1500);
                 } else {
-                    loShowMsg($r, 'ng', res.data || '発注データの取得に失敗しました。');
+                    loShowMsg($r, 'ng', 'LINE送信に失敗しました。' + (res.data.line_error || ''));
+                    $b.prop('disabled', false).text(origText);
                 }
             })
             .fail(function() {
-                $b.prop('disabled', false).text(origText);
                 loShowMsg($r, 'ng', '通信エラーが発生しました。');
-            });
-            return;
-        }
-
-        /* ── LIFF ID未設定 ── */
-        if (errCode === 'liff_id_missing') {
-            loShowMsg($r, 'ng',
-                '<span style="display:block;padding:12px 14px;background:#fff3cd;border:1px solid #ffc107;border-radius:8px;font-size:13px;line-height:1.7;color:#856404;">'
-                + '⚠️ <strong>LIFF IDが設定されていません。</strong><br>'
-                + 'WordPress管理画面 → LINE発注 → LINE設定 で LIFF ID を登録してください。'
-                + '</span>');
-            $b.prop('disabled', false).text(origText);
-            return;
-        }
-
-        /* ── SDK未ロード ── */
-        if (errCode === 'sdk_missing') {
-            loShowMsg($r, 'ng', 'LIFF SDKの読み込みに失敗しました。ページを再読み込みしてください。');
-            $b.prop('disabled', false).text(origText);
-            return;
-        }
-
-        /* ── init エラー ── */
-        if (!liffOk) {
-            loShowMsg($r, 'ng', 'LIFF初期化エラーが発生しました。ページを再読み込みして再度お試しください。');
-            $b.prop('disabled', false).text(origText);
-            return;
-        }
-
-        /* ── LINEアプリ内：AJAX → LINE送信 ── */
-        jQuery.post(loFront.ajax_url, {
-            action:            'lo_submit',
-            nonce:             loFront.nonce,
-            post_id:           pid,
-            lo_selected_model: checked.value
-        })
-        .done(function(res) {
-            if (!res.success) {
-                loShowMsg($r, 'ng', res.data || '送信に失敗しました。');
                 $b.prop('disabled', false).text(origText);
-                return;
-            }
-            var d           = res.data;
-            var orderId     = d.order_id;
-            var lineMessages = [];
-            if (d.has_image && d.img_url) {
-                lineMessages.push({ type:'image', originalContentUrl:d.img_url, previewImageUrl:d.img_url });
-            }
-            lineMessages.push({ type:'text', text:d.message });
+            });
+        }
 
-            loSendViaLiff(lineMessages, function(sent) {
-                jQuery.post(loFront.ajax_url, {
-                    action:'lo_liff_sent', nonce:loFront.nonce,
-                    order_id:orderId, result:sent?'sent':'failed'
+        /* localStorage / cookie からユーザーIDを取得 */
+        var lineUid = '';
+        try { lineUid = localStorage.getItem('lo_line_uid') || ''; } catch(e) {}
+        if (!lineUid) {
+            var cm = document.cookie.match('(?:^|; )lo_line_uid=([^;]*)');
+            if (cm) lineUid = decodeURIComponent(cm[1]);
+        }
+        if (lineUid) {
+            loDoLineSubmit(lineUid);
+        } else {
+            /* なければこの場で liff.init → getProfile を試みる */
+            var liffId = (typeof loFront !== 'undefined') ? loFront.liff_id : '';
+            if (!liffId || typeof liff === 'undefined') {
+                /* LIFF使用不可 → lo_line_to フォールバック（uid空で送信） */
+                loDoLineSubmit('');
+            } else {
+                $b.text('LINE認証中...');
+                liff.init({ liffId: liffId }).then(function() {
+                    if (liff.isLoggedIn()) {
+                        return liff.getProfile().then(function(profile) {
+                            try { localStorage.setItem('lo_line_uid', profile.userId); } catch(e) {}
+                            document.cookie = 'lo_line_uid=' + encodeURIComponent(profile.userId) + ';path=/;max-age=86400;SameSite=Lax';
+                            loDoLineSubmit(profile.userId);
+                        });
+                    } else {
+                        /* ログインしていない → lo_line_to フォールバック */
+                        loDoLineSubmit('');
+                    }
+                }).catch(function() {
+                    /* liff.init 失敗 → lo_line_to フォールバック */
+                    loDoLineSubmit('');
                 });
-                if (sent) {
-                    loShowMsg($r, 'ok', 'ご注文を受け付けました。LINEへ送信しました。');
-                } else {
-                    loShowMsg($r, 'ng', '発注を保存しましたが、LINE送信に失敗しました。管理画面から再送信できます。');
-                }
-                $b.prop('disabled', false).text(origText);
-            });
-        })
-        .fail(function() {
-            loShowMsg($r, 'ng', '通信エラーが発生しました。');
-            $b.prop('disabled', false).text(origText);
-        });
+            }
+        }
+        return;
+    }
+
+    /* ── LINEアプリ外 → AJAX で発注データ取得 → 注文内容プレビュー付きモーダル表示 ── */
+    jQuery.post(loFront.ajax_url, {
+        action:            'lo_submit',
+        nonce:             loFront.nonce,
+        post_id:           pid,
+        lo_selected_model: checked.value
+    })
+    .done(function(res) {
+        $b.prop('disabled', false).text(origText);
+        if (res.success) {
+            loShowLiffGuide(res.data);
+        } else {
+            loShowMsg($r, 'ng', res.data || '発注データの取得に失敗しました。');
+        }
+    })
+    .fail(function() {
+        $b.prop('disabled', false).text(origText);
+        loShowMsg($r, 'ng', '通信エラーが発生しました。');
     });
 }
 
@@ -2078,101 +2164,261 @@ function loSendViaLiff(messages, callback) {
 /* ================================================================
    QRコード自動送信：ページ読み込み時に order_id パラメータを検出
    URL例: https://liff.line.me/{LIFF_ID}?order_id=123
-   LINEアプリ内でこのURLが開かれたとき自動的に sendMessages() を実行
+
+   【重要】LIFF v2 の動作：
+   QRを読み取った直後、LIFFは以下のようにURLを書き換える：
+     endpoint.com/?liff.state=%2F%3Forder_id%3D123
+   この時点では order_id は liff.state の中にあり、直接取れない。
+   liff.init() を呼んだ後、LIFFが liff.state を展開して
+     endpoint.com/?order_id=123
+   に再リダイレクトする。
+   → 正しい順序：loIsLineApp() チェック → liff.init() → order_id 取得
 ================================================================ */
 jQuery(function(){
-    /* URLから order_id を取得（なければ通常表示のまま） */
-    var params  = new URLSearchParams(window.location.search);
-    var orderId = params.get('order_id');
-    if (!orderId) return;
 
-    /* order_id があれば LINEアプリかどうかに関わらず自動送信を試みる
-       （通常ブラウザの場合は liff.init がLINEへリダイレクトするか失敗する） */
+    /* LINEアプリ外では実行しない */
+    if (!loIsLineApp()) return;
 
-    /* 自動送信オーバーレイを表示 */
+    var liffId = (typeof loFront !== 'undefined') ? loFront.liff_id : '';
+    if (!liffId || typeof liff === 'undefined') return;
+
+    /* ── LINEユーザーID保存ヘルパー（localStorage + cookie 二重保存） ── */
+    function loSaveLineUid(uid) {
+        try { localStorage.setItem('lo_line_uid', uid); } catch(e) {}
+        document.cookie = 'lo_line_uid=' + encodeURIComponent(uid) + ';path=/;max-age=86400;SameSite=Lax';
+    }
+    function loGetLineUid() {
+        var uid = '';
+        try { uid = localStorage.getItem('lo_line_uid') || ''; } catch(e) {}
+        if (!uid) {
+            var m = document.cookie.match('(?:^|; )lo_line_uid=([^;]*)');
+            if (m) uid = decodeURIComponent(m[1]);
+        }
+        return uid;
+    }
+
+    /* ── LINEアプリ内なら liff.init → getProfile → 保存 ──
+       保存完了までページ内リンクを無効化し、遷移前に確実にユーザーIDを取得する */
+    var _loUidReady = !!loGetLineUid();
+    if (!_loUidReady) {
+        jQuery('body').on('click.lo-wait', 'a', function(e) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+        });
+        liff.init({ liffId: liffId }).then(function() {
+            if (liff.isLoggedIn()) {
+                return liff.getProfile().then(function(profile) {
+                    loSaveLineUid(profile.userId);
+                });
+            } else {
+                liff.login();
+            }
+        }).catch(function(e) {
+            console.warn('liff.init (uid save) error:', e);
+        }).then(function() {
+            _loUidReady = true;
+            jQuery('body').off('click.lo-wait', 'a');
+        });
+    }
+
+    /* ── order_id の事前チェック ──
+       直接URLにある場合（liff.init後の再リダイレクト後）はすぐ取れる。
+       liff.state に入っている場合（初回アクセス時）もここで検出して
+       無駄なページ描画を防ぐ。 */
+    function loExtractOrderId() {
+        var p = new URLSearchParams(window.location.search);
+        var oid = p.get('order_id');
+        if (oid) return oid;
+        /* liff.state をデコードして order_id を探す */
+        var st = p.get('liff.state');
+        if (st) {
+            try {
+                /* liff.state の値は "/?order_id=123" のような形式 */
+                var decoded = decodeURIComponent(st).replace(/^\/?\?/, '');
+                var sp = new URLSearchParams(decoded);
+                oid = sp.get('order_id');
+                if (oid) return oid;
+            } catch(e2) {}
+        }
+        return null;
+    }
+
+    var preCheckId = loExtractOrderId();
+    if (!preCheckId) return; /* order_id がどこにもなければ通常表示のまま */
+
+    /* 自動送信オーバーレイを表示（liff.init の前に見せる） */
     var overlay =
         '<div id="lo-auto-send-overlay" style="'
         +   'position:fixed;top:0;left:0;width:100%;height:100%;'
         +   'background:rgba(255,255,255,.95);z-index:99999;'
         +   'display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;">'
         +   '<div style="font-size:40px;">📤</div>'
-        +   '<p style="font-size:16px;font-weight:bold;color:#333;margin:0;">発注内容を送信しています...</p>'
+        +   '<p id="lo-auto-send-msg" style="font-size:16px;font-weight:bold;color:#333;margin:0;">発注内容を送信しています...</p>'
         +   '<div style="width:40px;height:40px;border:4px solid #eee;border-top:4px solid #06C755;'
         +       'border-radius:50%;animation:loSpin 1s linear infinite;"></div>'
         +   '<style>@keyframes loSpin{to{transform:rotate(360deg)}}</style>'
         + '</div>';
     jQuery('body').append(overlay);
 
-    /* LIFF 初期化 → order データ取得 → 自動送信 */
-    var liffId = (typeof loFront !== 'undefined') ? loFront.liff_id : '';
-    if (!liffId || typeof liff === 'undefined') {
-        jQuery('#lo-auto-send-overlay p').text('設定エラー：LIFF IDが未設定です。');
-        return;
+    /* ================================================================
+       sentBeacon ヘルパー
+       ─ jQuery.post を「主」として await（DB更新完了を待ってから成功画面）
+       ─ sendBeacon を「副」として同時発射（liff.closeWindow() 後でも届く）
+       ─ jQuery.post が失敗しても Deferred は必ず resolve → loAutoSendSuccess が動く
+    ================================================================ */
+    function loSentBeacon(orderId, result) {
+        var data = {
+            action:   'lo_liff_sent',
+            nonce:    loFront.nonce,
+            order_id: String(orderId),
+            result:   result
+        };
+
+        /* sendBeacon をバックアップとして即発射
+           liff.closeWindow() 後もリクエストを届けられる */
+        if (navigator && navigator.sendBeacon) {
+            var fd = new FormData();
+            for (var k in data) fd.append(k, data[k]);
+            navigator.sendBeacon(loFront.ajax_url, fd);
+        }
+
+        /* jQuery.post を await して DB 更新完了を確認してから .then() へ進む。
+           成功・失敗どちらでも必ず resolve（.always）して画面を止めない */
+        var dfd = jQuery.Deferred();
+        jQuery.post(loFront.ajax_url, data).always(function() {
+            dfd.resolve();
+        });
+        return dfd.promise();
     }
 
-    liff.init({ liffId: liffId, withLoginOnExternalBrowser: true })
+    /* ================================================================
+       liff.init() タイムアウト（15秒）
+       LIFF認証がハングした場合に'failed'でDB更新してエラー表示する
+    ================================================================ */
+    var _liffInitDone = false;
+    var _liffInitTimer = setTimeout(function() {
+        if (_liffInitDone) return;
+        _liffInitDone = true;
+        console.error('liff.init timeout');
+        loSentBeacon(preCheckId, 'failed');
+        loAutoSendError('LIFF初期化がタイムアウトしました（15秒）。\nLINEアプリを再起動して、もう一度QRを読み取ってください。', preCheckId);
+    }, 15000);
+
+    /* liff.init() を先に呼ぶ
+       → LIFFが liff.state を展開し、URLを ?order_id=123 に書き換える
+       → その後 window.location.search から order_id を正確に取得できる */
+    liff.init({ liffId: liffId })
     .then(function() {
+        clearTimeout(_liffInitTimer);
+        _liffInitDone = true;
+        /* init 完了後、URLが書き換わっているので再取得 */
+        var params2 = new URLSearchParams(window.location.search);
+        var orderId = params2.get('order_id') || preCheckId;
+
         /* DB から発注データを取得 */
         return jQuery.post(loFront.ajax_url, {
             action:   'lo_get_order',
             nonce:    loFront.nonce,
             order_id: orderId
-        });
-    })
-    .then(function(res) {
-        if (!res.success) throw new Error(res.data || '発注データが見つかりません。');
+        }).then(function(res) {
+            if (!res.success) throw new Error(res.data || '発注データが見つかりません。');
+            var d = res.data;
 
-        var d = res.data;
-        /* 既に送信済みの場合はスキップ */
-        if (d.status === 'sent_liff' || d.status === 'sent') {
-            jQuery('#lo-auto-send-overlay').html(
-                '<div style="font-size:40px;">✅</div>'
-                + '<p style="font-size:15px;font-weight:bold;color:#00B900;margin:0;">この発注は送信済みです。</p>'
-            );
-            setTimeout(function(){ liff.closeWindow(); }, 2500);
-            return;
-        }
+            /* 既に送信済みの場合はスキップ */
+            if (d.status === 'sent_liff' || d.status === 'sent') {
+                jQuery('#lo-auto-send-overlay').html(
+                    '<div style="font-size:40px;">✅</div>'
+                    + '<p style="font-size:15px;font-weight:bold;color:#00B900;margin:0;">この発注は送信済みです。</p>'
+                );
+                setTimeout(function(){ liff.closeWindow(); }, 2500);
+                return;
+            }
 
-        /* LINEメッセージを組み立て */
-        var msgs = [];
-        if (d.has_image && d.img_url) {
-            msgs.push({ type:'image', originalContentUrl:d.img_url, previewImageUrl:d.img_url });
-        }
-        msgs.push({ type:'text', text:d.message });
+            /* LINEメッセージを組み立て */
+            var msgs = [];
+            if (d.has_image && d.img_url) {
+                msgs.push({ type:'image', originalContentUrl:d.img_url, previewImageUrl:d.img_url });
+            }
+            msgs.push({ type:'text', text:d.message });
 
-        /* sendMessages で送信 */
-        return liff.sendMessages(msgs).then(function(){
-            /* DB更新 */
-            jQuery.post(loFront.ajax_url, {
-                action:   'lo_liff_sent',
-                nonce:    loFront.nonce,
-                order_id: orderId,
-                result:   'sent'
+            jQuery('#lo-auto-send-msg').text('LINEへ送信しています...');
+
+            /* sendMessages を試みる（トーク画面から開いた場合に有効） */
+            return liff.sendMessages(msgs)
+            .then(function(){
+                /* ★重要: sendBeaconでDB更新→完了後に成功画面（WebView終了前に確実に届ける） */
+                return loSentBeacon(orderId, 'sent');
+            })
+            .then(function(){
+                loAutoSendSuccess();
+            })
+            .catch(function(sendErr){
+                /* sendMessages 失敗（トーク外から開いた場合）
+                   → shareTargetPicker で送信先を選択させる */
+                console.warn('sendMessages failed:', sendErr);
+                if (liff.isApiAvailable('shareTargetPicker')) {
+                    jQuery('#lo-auto-send-msg').text('送信先のトークを選んでください...');
+                    liff.shareTargetPicker(msgs, { isMultiple: false })
+                    .then(function(pickerRes) {
+                        var sent = !!(pickerRes && pickerRes.status === 'success');
+                        loSentBeacon(orderId, sent ? 'sent' : 'failed');
+                        if (sent) {
+                            loAutoSendSuccess();
+                        } else {
+                            loAutoSendError('送信がキャンセルされました。', orderId);
+                        }
+                    })
+                    .catch(function(pickerErr) {
+                        console.error('shareTargetPicker failed:', pickerErr);
+                        loSentBeacon(orderId, 'failed');
+                        loAutoSendError('送信に失敗しました。\n' + (pickerErr.message || pickerErr), orderId);
+                    });
+                } else {
+                    /* shareTargetPicker も使えない場合 */
+                    loSentBeacon(orderId, 'failed');
+                    loAutoSendError('この画面からは送信できません。\nLINEのトーク画面から再度お試しください。\n(' + (sendErr.message || sendErr) + ')', orderId);
+                }
             });
-            /* 完了表示 → 自動でウィンドウを閉じる */
-            jQuery('#lo-auto-send-overlay').html(
-                '<div style="font-size:48px;">✅</div>'
-                + '<p style="font-size:17px;font-weight:bold;color:#00B900;margin:0;">発注を送信しました！</p>'
-                + '<p style="font-size:13px;color:#888;margin:0;">このウィンドウは自動的に閉じます</p>'
-            );
-            setTimeout(function(){ liff.closeWindow(); }, 2500);
         });
     })
     .catch(function(e) {
+        clearTimeout(_liffInitTimer);
+        _liffInitDone = true;
         console.error('auto send error:', e);
-        /* DB更新（失敗） */
-        jQuery.post(loFront.ajax_url, {
-            action:   'lo_liff_sent',
-            nonce:    loFront.nonce,
-            order_id: orderId,
-            result:   'failed'
-        });
-        jQuery('#lo-auto-send-overlay').html(
-            '<div style="font-size:40px;">❌</div>'
-            + '<p style="font-size:15px;font-weight:bold;color:#dc3545;margin:0;">送信に失敗しました。</p>'
-            + '<p style="font-size:12px;color:#888;margin:8px 0 0;">' + (e.message || e) + '</p>'
-        );
+        /* liff.init のリダイレクト処理は catch に入らないため
+           ここに来るのは本当のエラー（認証失敗・ネットワーク等） */
+        var params3 = new URLSearchParams(window.location.search);
+        var orderId2 = params3.get('order_id') || preCheckId;
+        if (orderId2) {
+            loSentBeacon(orderId2, 'failed');
+        }
+        loAutoSendError((e.message || String(e)), orderId2);
     });
+
+    /* 成功表示 */
+    function loAutoSendSuccess() {
+        jQuery('#lo-auto-send-overlay').html(
+            '<div style="font-size:48px;">✅</div>'
+            + '<p style="font-size:17px;font-weight:bold;color:#00B900;margin:0;">発注を送信しました！</p>'
+            + '<p style="font-size:13px;color:#888;margin:4px 0 0;">このウィンドウは自動的に閉じます</p>'
+        );
+        setTimeout(function(){ try{ liff.closeWindow(); }catch(ex){} }, 2500);
+    }
+
+    /* エラー表示（エラー内容を画面に見せる） */
+    function loAutoSendError(msg, orderId3) {
+        jQuery('#lo-auto-send-overlay').html(
+            '<div style="font-size:36px;">❌</div>'
+            + '<p style="font-size:15px;font-weight:bold;color:#dc3545;margin:0;">送信に失敗しました</p>'
+            + '<p style="font-size:12px;color:#666;background:#f5f5f5;border-radius:6px;padding:8px 12px;margin:8px 0 0;'
+            +    'max-width:90%;white-space:pre-wrap;word-break:break-all;text-align:left;">'
+            +    (msg || '不明なエラー')
+            + '</p>'
+            + (orderId3 ? '<p style="font-size:11px;color:#aaa;margin:4px 0 0;">発注ID: ' + orderId3 + '</p>' : '')
+            + '<button onclick="document.getElementById(\'lo-auto-send-overlay\').style.display=\'none\';" '
+            +     'style="margin-top:12px;padding:8px 24px;background:#555;color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer;">閉じる</button>'
+        );
+    }
 });
 </script>
 <?php }
