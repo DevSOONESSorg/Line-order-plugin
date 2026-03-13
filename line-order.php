@@ -4,8 +4,8 @@
  * Plugin URI:  https://example.com
  * Description: 商品情報を管理し、LIFFアプリ経由でLINEへ発注内容を送信するプラグイン
  * Version:     2.1.0
- * Author:      Custom Plugin
- * License:     GPL2
+ * Author:      友利 哲也
+ * License:     SOONESS Inc.
  * Text Domain: line-order
  * Requires at least: 5.0
  * Requires PHP: 7.4
@@ -15,6 +15,7 @@
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
+
 
 if ( ! defined('LO_VERSION') )    define( 'LO_VERSION', '2.1.0' );
 if ( ! defined('LO_URL') )        define( 'LO_URL', plugin_dir_url( __FILE__ ) );
@@ -458,12 +459,13 @@ Content-Type: application/json
 </div>
 <?php }
 
+
 /* ============================================================
    Messaging API 送信（管理画面からの再送信のみで使用）
 ============================================================ */
-function lo_send_line( $message, $img_url = '' ) {
+function lo_send_line( $message, $img_url = '', $to_override = '' ) {
     $token = get_option('lo_line_token','');
-    $to    = get_option('lo_line_to','');
+    $to    = ! empty($to_override) ? $to_override : get_option('lo_line_to','');
     if ( empty($token) ) return array('success'=>false,'message'=>'LINEトークンが未設定です。');
     if ( empty($to) )    return array('success'=>false,'message'=>'送信先が未設定です。');
 
@@ -557,12 +559,35 @@ function lo_ajax_submit() {
 
     $img_https = $img_url ? preg_replace('/^http:/', 'https:', $img_url) : '';
 
-    /* フロントの LIFF sendMessages 用にデータを返す */
+    /* LINEアプリ内からのリクエスト → Messaging API で即送信 */
+    $send_via_api = ! empty( $_POST['line_app'] );
+    $line_sent    = false;
+    if ( $send_via_api ) {
+        $line_uid = sanitize_text_field( $_POST['line_uid'] ?? '' );
+        /* POST にない場合は cookie からフォールバック */
+        if ( empty($line_uid) && ! empty($_COOKIE['lo_line_uid']) ) {
+            $line_uid = sanitize_text_field( $_COOKIE['lo_line_uid'] );
+        }
+        $result = lo_send_line( $message, $img_https, $line_uid );
+        if ( $result['success'] ) {
+            $line_sent = true;
+            $wpdb->update(
+                $wpdb->prefix . 'lo_orders',
+                array( 'line_status' => 'sent' ),
+                array( 'id' => $order_id ),
+                array( '%s' ),
+                array( '%d' )
+            );
+        }
+    }
+
     wp_send_json_success( array(
-        'order_id'  => $order_id,
-        'message'   => $message,
-        'img_url'   => $img_https,
-        'has_image' => !empty($img_https),
+        'order_id'   => $order_id,
+        'message'    => $message,
+        'img_url'    => $img_https,
+        'has_image'  => !empty($img_https),
+        'line_sent'  => $line_sent,
+        'line_error' => ( $send_via_api && ! $line_sent ) ? ( $result['message'] ?? '' ) : '',
     ) );
 }
 
@@ -1722,7 +1747,7 @@ add_action('wp_enqueue_scripts', 'lo_front_scripts');
 add_action('wp_head',            'lo_front_css');
 add_action('wp_head',            'lo_liff_sdk_tag');
 add_action('wp_head',            'lo_front_vars');
-add_action('wp_head',            'lo_front_js');
+add_action('wp_footer',          'lo_front_js', 99);
 
 function lo_front_scripts() {
     wp_enqueue_script('jquery');
@@ -2020,96 +2045,97 @@ function loSubmit(pid) {
     $b.prop('disabled', true).text('処理中...');
     $r.removeClass('ok ng ng-persist').html('');
 
-    loInitLiff(function(liffOk, errCode) {
+    /* ── LINEアプリ内：AJAX で保存 + Messaging API 送信 → LINEブラウザを閉じる ── */
+    if (loIsLineApp()) {
 
-        /* ── LINEアプリ外 → AJAX で発注データ取得 → 注文内容プレビュー付きモーダル表示 ── */
-        if (errCode === 'not_line_app') {
+        /* ユーザーID取得 → 送信を実行する内部関数 */
+        function loDoLineSubmit(uid) {
             jQuery.post(loFront.ajax_url, {
                 action:            'lo_submit',
                 nonce:             loFront.nonce,
                 post_id:           pid,
-                lo_selected_model: checked.value
+                lo_selected_model: checked.value,
+                line_app:          '1',
+                line_uid:          uid
             })
             .done(function(res) {
-                $b.prop('disabled', false).text(origText);
-                if (res.success) {
-                    loShowLiffGuide(res.data);
+                if (!res.success) {
+                    loShowMsg($r, 'ng', res.data || '送信に失敗しました。');
+                    $b.prop('disabled', false).text(origText);
+                    return;
+                }
+                if (res.data.line_sent) {
+                    loShowMsg($r, 'ok', 'ご注文を受け付けました。LINEへ送信しました。');
+                    setTimeout(function(){
+                        try { liff.closeWindow(); } catch(e) {}
+                        window.close();
+                    }, 1500);
                 } else {
-                    loShowMsg($r, 'ng', res.data || '発注データの取得に失敗しました。');
+                    loShowMsg($r, 'ng', 'LINE送信に失敗しました。' + (res.data.line_error || ''));
+                    $b.prop('disabled', false).text(origText);
                 }
             })
             .fail(function() {
-                $b.prop('disabled', false).text(origText);
                 loShowMsg($r, 'ng', '通信エラーが発生しました。');
-            });
-            return;
-        }
-
-        /* ── LIFF ID未設定 ── */
-        if (errCode === 'liff_id_missing') {
-            loShowMsg($r, 'ng',
-                '<span style="display:block;padding:12px 14px;background:#fff3cd;border:1px solid #ffc107;border-radius:8px;font-size:13px;line-height:1.7;color:#856404;">'
-                + '⚠️ <strong>LIFF IDが設定されていません。</strong><br>'
-                + 'WordPress管理画面 → LINE発注 → LINE設定 で LIFF ID を登録してください。'
-                + '</span>');
-            $b.prop('disabled', false).text(origText);
-            return;
-        }
-
-        /* ── SDK未ロード ── */
-        if (errCode === 'sdk_missing') {
-            loShowMsg($r, 'ng', 'LIFF SDKの読み込みに失敗しました。ページを再読み込みしてください。');
-            $b.prop('disabled', false).text(origText);
-            return;
-        }
-
-        /* ── init エラー ── */
-        if (!liffOk) {
-            loShowMsg($r, 'ng', 'LIFF初期化エラーが発生しました。ページを再読み込みして再度お試しください。');
-            $b.prop('disabled', false).text(origText);
-            return;
-        }
-
-        /* ── LINEアプリ内：AJAX → LINE送信 ── */
-        jQuery.post(loFront.ajax_url, {
-            action:            'lo_submit',
-            nonce:             loFront.nonce,
-            post_id:           pid,
-            lo_selected_model: checked.value
-        })
-        .done(function(res) {
-            if (!res.success) {
-                loShowMsg($r, 'ng', res.data || '送信に失敗しました。');
                 $b.prop('disabled', false).text(origText);
-                return;
-            }
-            var d           = res.data;
-            var orderId     = d.order_id;
-            var lineMessages = [];
-            if (d.has_image && d.img_url) {
-                lineMessages.push({ type:'image', originalContentUrl:d.img_url, previewImageUrl:d.img_url });
-            }
-            lineMessages.push({ type:'text', text:d.message });
+            });
+        }
 
-            loSendViaLiff(lineMessages, function(sent) {
-                /* jQuery.post を await して DB 更新してから表示 */
-                jQuery.post(loFront.ajax_url, {
-                    action:'lo_liff_sent', nonce:loFront.nonce,
-                    order_id:String(orderId), result:sent?'sent':'failed'
-                }).always(function() {
-                    if (sent) {
-                        loShowMsg($r, 'ok', 'ご注文を受け付けました。LINEへ送信しました。');
+        /* localStorage / cookie からユーザーIDを取得 */
+        var lineUid = '';
+        try { lineUid = localStorage.getItem('lo_line_uid') || ''; } catch(e) {}
+        if (!lineUid) {
+            var cm = document.cookie.match('(?:^|; )lo_line_uid=([^;]*)');
+            if (cm) lineUid = decodeURIComponent(cm[1]);
+        }
+        if (lineUid) {
+            loDoLineSubmit(lineUid);
+        } else {
+            /* なければこの場で liff.init → getProfile を試みる */
+            var liffId = (typeof loFront !== 'undefined') ? loFront.liff_id : '';
+            if (!liffId || typeof liff === 'undefined') {
+                /* LIFF使用不可 → lo_line_to フォールバック（uid空で送信） */
+                loDoLineSubmit('');
+            } else {
+                $b.text('LINE認証中...');
+                liff.init({ liffId: liffId }).then(function() {
+                    if (liff.isLoggedIn()) {
+                        return liff.getProfile().then(function(profile) {
+                            try { localStorage.setItem('lo_line_uid', profile.userId); } catch(e) {}
+                            document.cookie = 'lo_line_uid=' + encodeURIComponent(profile.userId) + ';path=/;max-age=86400;SameSite=Lax';
+                            loDoLineSubmit(profile.userId);
+                        });
                     } else {
-                        loShowMsg($r, 'ng', '発注を保存しましたが、LINE送信に失敗しました。管理画面から再送信できます。');
+                        /* ログインしていない → lo_line_to フォールバック */
+                        loDoLineSubmit('');
                     }
-                    $b.prop('disabled', false).text(origText);
+                }).catch(function() {
+                    /* liff.init 失敗 → lo_line_to フォールバック */
+                    loDoLineSubmit('');
                 });
-            }); /* ← loSendViaLiff コールバックを閉じる（この1行が欠落していた） */
-        })
-        .fail(function() {
-            loShowMsg($r, 'ng', '通信エラーが発生しました。');
-            $b.prop('disabled', false).text(origText);
-        });
+            }
+        }
+        return;
+    }
+
+    /* ── LINEアプリ外 → AJAX で発注データ取得 → 注文内容プレビュー付きモーダル表示 ── */
+    jQuery.post(loFront.ajax_url, {
+        action:            'lo_submit',
+        nonce:             loFront.nonce,
+        post_id:           pid,
+        lo_selected_model: checked.value
+    })
+    .done(function(res) {
+        $b.prop('disabled', false).text(origText);
+        if (res.success) {
+            loShowLiffGuide(res.data);
+        } else {
+            loShowMsg($r, 'ng', res.data || '発注データの取得に失敗しました。');
+        }
+    })
+    .fail(function() {
+        $b.prop('disabled', false).text(origText);
+        loShowMsg($r, 'ng', '通信エラーが発生しました。');
     });
 }
 
@@ -2155,6 +2181,45 @@ jQuery(function(){
 
     var liffId = (typeof loFront !== 'undefined') ? loFront.liff_id : '';
     if (!liffId || typeof liff === 'undefined') return;
+
+    /* ── LINEユーザーID保存ヘルパー（localStorage + cookie 二重保存） ── */
+    function loSaveLineUid(uid) {
+        try { localStorage.setItem('lo_line_uid', uid); } catch(e) {}
+        document.cookie = 'lo_line_uid=' + encodeURIComponent(uid) + ';path=/;max-age=86400;SameSite=Lax';
+    }
+    function loGetLineUid() {
+        var uid = '';
+        try { uid = localStorage.getItem('lo_line_uid') || ''; } catch(e) {}
+        if (!uid) {
+            var m = document.cookie.match('(?:^|; )lo_line_uid=([^;]*)');
+            if (m) uid = decodeURIComponent(m[1]);
+        }
+        return uid;
+    }
+
+    /* ── LINEアプリ内なら liff.init → getProfile → 保存 ──
+       保存完了までページ内リンクを無効化し、遷移前に確実にユーザーIDを取得する */
+    var _loUidReady = !!loGetLineUid();
+    if (!_loUidReady) {
+        jQuery('body').on('click.lo-wait', 'a', function(e) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+        });
+        liff.init({ liffId: liffId }).then(function() {
+            if (liff.isLoggedIn()) {
+                return liff.getProfile().then(function(profile) {
+                    loSaveLineUid(profile.userId);
+                });
+            } else {
+                liff.login();
+            }
+        }).catch(function(e) {
+            console.warn('liff.init (uid save) error:', e);
+        }).then(function() {
+            _loUidReady = true;
+            jQuery('body').off('click.lo-wait', 'a');
+        });
+    }
 
     /* ── order_id の事前チェック ──
        直接URLにある場合（liff.init後の再リダイレクト後）はすぐ取れる。
