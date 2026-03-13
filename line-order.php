@@ -845,6 +845,46 @@ function lo_add_boxes() {
     add_meta_box('lo_mdl',  '③ 型番／ラジオボタン', 'lo_box_mdl',  'lo_product','normal','high');
     add_meta_box('lo_btn',  '④ 送信ボタン設定',     'lo_box_btn',  'lo_product','side','default');
     add_meta_box('lo_sc',   '⑤ ショートコード',     'lo_box_sc',   'lo_product','side','high');
+
+    /* --- lo_product で不要なプラグイン／テーマのメタボックスを非表示 --- */
+    $remove = array(
+        // SWELL
+        'swell_custom_css_js'   => 'normal',   // カスタムCSS&JS
+        'swell_settings'        => 'normal',   // SWELLの設定
+        // WPCode
+        'wpcode-metabox-snippets' => 'normal', // ページスクリプト
+        // WordPress 標準（不要なら）
+        'slugdiv'               => 'normal',   // スラッグ
+        'postcustom'            => 'normal',   // カスタムフィールド
+        'commentsdiv'           => 'normal',   // コメント
+        'commentstatusdiv'      => 'normal',   // ディスカッション
+        'authordiv'             => 'normal',   // 作成者
+    );
+    foreach ( $remove as $id => $ctx ) {
+        remove_meta_box( $id, 'lo_product', $ctx );
+    }
+}
+
+/**
+ * 優先度を下げて実行し、他プラグインが後から追加するメタボックスも確実に除去する
+ */
+add_action('add_meta_boxes_lo_product', 'lo_remove_extra_metaboxes', 999);
+function lo_remove_extra_metaboxes() {
+    global $wp_meta_boxes;
+    if ( empty( $wp_meta_boxes['lo_product'] ) ) return;
+
+    /* このプラグイン自身のメタボックスだけ残す */
+    $keep = array( 'lo_img', 'lo_info', 'lo_mdl', 'lo_btn', 'lo_sc', 'submitdiv' );
+
+    foreach ( $wp_meta_boxes['lo_product'] as $context => $priorities ) {
+        foreach ( $priorities as $priority => $boxes ) {
+            foreach ( $boxes as $id => $box ) {
+                if ( ! in_array( $id, $keep, true ) ) {
+                    unset( $wp_meta_boxes['lo_product'][ $context ][ $priority ][ $id ] );
+                }
+            }
+        }
+    }
 }
 
 function lo_box_img($post) {
@@ -1799,7 +1839,8 @@ function lo_front_css() { ?>
 .lo-cpbtn:hover{background:#00B900;color:#fff}
 .lo-cdet{margin-top:8px;font-size:12px;color:#666;line-height:1.6;background:#f9f9f9;border-radius:4px;padding:6px 8px;margin-left:32px}
 .lo-srow{display:flex;justify-content:center;margin-top:36px}
-.lo-sbtn{display:inline-flex;align-items:center;justify-content:center;min-width:260px;padding:17px 56px;border-radius:60px;border:none;cursor:pointer;font-size:17px;font-weight:700;letter-spacing:.05em;transition:opacity .2s,transform .15s,box-shadow .2s;box-shadow:0 5px 18px rgba(0,0,0,.18);outline:none}
+.lo-sbtn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-width:260px;padding:17px 56px;border-radius:60px;border:none;cursor:pointer;font-size:17px;font-weight:700;letter-spacing:.05em;transition:opacity .2s,transform .15s,box-shadow .2s;box-shadow:0 5px 18px rgba(0,0,0,.18);outline:none}
+.lo-line-icon{width:1.4em;height:1.4em;flex-shrink:0}
 .lo-sbtn:hover{opacity:.88;transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.22)}
 .lo-sbtn:active{transform:translateY(0)}
 .lo-sbtn:disabled{opacity:.6;cursor:not-allowed;transform:none}
@@ -2507,6 +2548,7 @@ function lo_shortcode($atts) {
                     onclick="loSubmit(<?php echo $pid; ?>)"
                     style="background:<?php echo esc_attr($bg); ?>;color:<?php echo esc_attr($cl); ?>;"
                     data-pid="<?php echo $pid; ?>">
+                <svg class="lo-line-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="currentColor"><path d="M60 0C26.86 0 0 22.57 0 50.32c0 24.87 22.07 45.72 51.88 49.64 2.02.44 4.77 1.33 5.46 3.05.63 1.56.41 4.01.2 5.59 0 0-.73 4.37-.89 5.3-.27 1.56-1.24 6.11 5.35 3.33s35.58-20.94 48.55-35.85h-.01C119.81 71.37 120 61.14 120 50.32 120 22.57 93.14 0 60 0zm-24.2 65.2a1.76 1.76 0 0 1-1.76 1.76H20.47a1.76 1.76 0 0 1-1.76-1.76V38.28a1.76 1.76 0 0 1 1.76-1.76h0a1.76 1.76 0 0 1 1.76 1.76v25.16h11.81a1.76 1.76 0 0 1 1.76 1.76zm8.44 0a1.76 1.76 0 0 1-1.76 1.76h0a1.76 1.76 0 0 1-1.76-1.76V38.28a1.76 1.76 0 0 1 1.76-1.76h0a1.76 1.76 0 0 1 1.76 1.76zm30.56 0a1.76 1.76 0 0 1-1.76 1.76h0a1.76 1.76 0 0 1-1.41-.71L58.71 48.56V65.2a1.76 1.76 0 0 1-1.76 1.76h0a1.76 1.76 0 0 1-1.76-1.76V38.28a1.76 1.76 0 0 1 1.76-1.76h0a1.76 1.76 0 0 1 1.41.71l12.92 17.68V38.28a1.76 1.76 0 0 1 1.76-1.76h0a1.76 1.76 0 0 1 1.76 1.76zm19.96-23.4a1.76 1.76 0 0 1-1.76 1.76H81.19v7.23H93a1.76 1.76 0 0 1 1.76 1.76 1.76 1.76 0 0 1-1.76 1.76H81.19v7.23H93a1.76 1.76 0 0 1 1.76 1.76A1.76 1.76 0 0 1 93 65.06h0-13.57a1.76 1.76 0 0 1-1.76-1.76V38.28a1.76 1.76 0 0 1 1.76-1.76H93a1.76 1.76 0 0 1 1.76 1.76z"/></svg>
                 <?php echo esc_html($bt); ?>
             </button>
         </div>
@@ -2843,3 +2885,4 @@ function lo_render_products_grid( $title, $description, $posts ) {
     <?php
     return ob_get_clean();
 }
+
