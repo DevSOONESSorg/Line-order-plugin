@@ -4,8 +4,8 @@
  * Plugin URI:  https://example.com
  * Description: 商品情報を管理し、LIFFアプリ経由でLINEへ発注内容を送信するプラグイン
  * Version:     2.1.0
- * Author:      Custom Plugin
- * License:     GPL2
+ * Author:      友利 哲也
+ * License:     SOONESS Inc.
  * Text Domain: line-order
  * Requires at least: 5.0
  * Requires PHP: 7.4
